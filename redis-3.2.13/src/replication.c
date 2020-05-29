@@ -419,11 +419,15 @@ int masterTryPartialResynchronization(client *c) {
     char buf[128];
     int buflen;
 
+    // 下面会检查 runid 和 offset 来判断是否可以继续部分同步 还是 全同步（重新开始同步）
+    // 首次PSYNC命令时 runid = ? offset = -1 ，即会跳转到 need_full_resync
     /* Is the runid of this master the same advertised by the wannabe slave
      * via PSYNC? If runid changed this master is a different instance and
      * there is no way to continue. */
+    // [REPL SM 005] master收到psync命令 首次同步 master_runid = ? offset=-1
     if (strcasecmp(master_runid, server.runid)) {
         /* Run id "?" is used by slaves that want to force a full resync. */
+        // 首次同步走到这里, 表示要全量同步
         if (master_runid[0] != '?') {
             serverLog(LL_NOTICE,"Partial resynchronization not accepted: "
                 "Runid mismatch (Client asked for runid '%s', my runid is '%s')",
@@ -584,6 +588,10 @@ void syncCommand(client *c) {
     serverLog(LL_NOTICE,"Slave %s asks for synchronization",
         replicationGetSlaveName(c));
 
+    // 开始处理收到slave发送的 sync 命令
+    // slave发送该命令在 connectWithMaster->syncWithMaster 中发送。
+    // 当前文件分为两个部分，前半部分处理master逻辑， 后半部分处理slave逻辑，见分割线  --- MASTER --- / --- SLAVE ---
+
     /* Try a partial resynchronization if this is a PSYNC command.
      * If it fails, we continue with usual full resynchronization, however
      * when this happens masterTryPartialResynchronization() already
@@ -594,10 +602,12 @@ void syncCommand(client *c) {
      * So the slave knows the new runid and offset to try a PSYNC later
      * if the connection with the master is lost. */
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
+        // [REPL SM 005] master收到psync命令
         if (masterTryPartialResynchronization(c) == C_OK) {
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
         } else {
+            // slave首次全量同步时会到这里
             char *master_runid = c->argv[1]->ptr;
 
             /* Increment stats for failed PSYNCs, but only if the
@@ -616,6 +626,7 @@ void syncCommand(client *c) {
     /* Full resynchronization. */
     server.stat_sync_full++;
 
+    // [REPL SM 005-2] master收到psync命令, 准备进行全量同步, 设置slave得链接状态, 等待bgsave
     /* Setup the slave as one waiting for BGSAVE to start. The following code
      * paths will change the state if we handle the slave differently. */
     c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
@@ -625,6 +636,7 @@ void syncCommand(client *c) {
     c->flags |= CLIENT_SLAVE;
     listAddNodeTail(server.slaves,c);
 
+    // 分情况处理，可能当前有正在备份得进程
     /* CASE 1: BGSAVE is in progress, with disk target. */
     if (server.rdb_child_pid != -1 &&
         server.rdb_child_type == RDB_CHILD_TYPE_DISK)
@@ -1284,7 +1296,10 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
 
     /* Writing half */
     if (!read_reply) {
-        // 发送 PSYNC 命令，主要需要一个offset
+        // 发送 PSYNC 命令，主要需要一个offset, 和 一个runid
+        // 首次同步时 没有cached_master 。 即没有 runid = ? 和 offset = -1
+        // master 处理消息在 syncCommand 中
+
         /* Initially set repl_master_initial_offset to -1 to mark the current
          * master run_id and offset as not valid. Later if we'll be able to do
          * a FULL resync using the PSYNC command we'll set the offset at the
@@ -1303,6 +1318,8 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         }
 
         /* Issue the PSYNC command */
+        // [REPL SM 005] slave第一次发送给master同步数据请求
+        // 首次同步时runid=? offest=-1
         reply = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PSYNC",psync_runid,psync_offset,NULL);
         if (reply != NULL) {
             serverLog(LL_WARNING,"Unable to send PSYNC to master: %s",reply);
@@ -1323,8 +1340,11 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         return PSYNC_WAIT_REPLY;
     }
 
+    // 移除read事件，使得不在调用 syncWithMaster 函数
     aeDeleteFileEvent(server.el,fd,AE_READABLE);
 
+    // 根据master返回的内容分情况处理，
+    // master 应该是在处理psync时传入的offset 来确定当前slave的同步进度，返回不同消息
     if (!strncmp(reply,"+FULLRESYNC",11)) {
         char *runid = NULL, *offset = NULL;
 
@@ -1386,6 +1406,9 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
     return PSYNC_NOT_SUPPORTED;
 }
 
+// 主备同步过程步骤 使用标记来标识整个过程
+// [REPL MS xxx]    MS=Master->Slave
+// [REPL SM xxx]    SM=Slave->Master , xxx = 001, 002... 表示消息处理顺序 始终有序
 void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     char tmpfile[256], *err = NULL;
     int dfd = -1, maxtries = 5;
@@ -1411,10 +1434,12 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         goto error;
     }
 
+    // 首次执行到这里的时候 因为设置了write事件，会执行下面的逻辑 给master发送PING
+
     /* Send a PING to check the master is able to reply without errors. */
     if (server.repl_state == REPL_STATE_CONNECTING) {
         // 连接成功后添加的可写事件 会触发执行到这里，先要把可写事件清除，设置下状态 REPL_STATE_RECEIVE_PONG, （可理解为等待PONG）
-        // 发送 PING 命令 (同步发送send命令)
+        // 发送 PING 命令 (同步发送send命令)，注意这里没有移除read事件，因此当master回消息时会继续被调用到
         serverLog(LL_NOTICE,"Non blocking connect for SYNC fired the event.");
         /* Delete the writable event so that the readable event remains
          * registered and we can wait for the PONG reply. */
@@ -1422,6 +1447,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         server.repl_state = REPL_STATE_RECEIVE_PONG;
         /* Send the PING, don't check for errors at all, we have the timeout
          * that will take care about this. */
+        // [REPL SM 001] 发送PING消息。对于master来说，当前slave和普通client没有区别, master 会回复一个 PONG（pingCommand）
         err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PING",NULL);
         if (err) goto write_error;
         return;
@@ -1430,6 +1456,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Receive the PONG command. */
     if (server.repl_state == REPL_STATE_RECEIVE_PONG) {
         // 当前slave的fd有数据时，并且发送PING后，到这里，同步读取内容到err的缓冲区中
+        // [REPL MS 002] master回复pong包 slave准备到master auth
         err = sendSynchronousCommand(SYNC_CMD_READ,fd,NULL);
 
         /* We accept only two replies as valid, a positive +PONG reply
@@ -1457,6 +1484,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         // 上面的逻辑没有问题会执行到这里，检查mater是否需要auth，这个通过配置确认，必须保证时一致正确的
         // 即master需要auth，则masterauth要配置好正确的密码；否在不需要配置值
         if (server.masterauth) {
+            // [REPL SM 003] 发送AUTH消息到master
             err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"AUTH",server.masterauth,NULL);
             if (err) goto write_error;
             server.repl_state = REPL_STATE_RECEIVE_AUTH;
@@ -1469,6 +1497,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Receive AUTH reply. */
     if (server.repl_state == REPL_STATE_RECEIVE_AUTH) {
         // master  对auth的消息返回，同步读取结果
+        // [REPL MS 004] master返回AUTH消息,后面一系列conf消息忽略
         err = sendSynchronousCommand(SYNC_CMD_READ,fd,NULL);
         if (err[0] == '-') {
             serverLog(LL_WARNING,"Unable to AUTH to MASTER: %s",err);
@@ -1572,6 +1601,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
      * reconnection attempt. */
     if (server.repl_state == REPL_STATE_SEND_PSYNC) {
         // 到这里 一些认证和配置设置完成了，发送一个psync命令给master
+        // [REPL SM 005] slave第一次发送给master同步数据请求, 注意第二个参数是0表示发送消息
         if (slaveTryPartialResynchronization(fd,0) == PSYNC_WRITE_ERROR) {
             err = sdsnew("Write error sending the PSYNC command.");
             goto write_error;
@@ -1588,7 +1618,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         goto error;
     }
 
-    // 读取上面发送psync命令的结果
+    // 读取上面发送psync命令的结果，注意函数调用里读取到结果后会先删除read事件，即当前函数不会在被调用
     psync_result = slaveTryPartialResynchronization(fd,1);
     if (psync_result == PSYNC_WAIT_REPLY) return; /* Try again later... */
 
