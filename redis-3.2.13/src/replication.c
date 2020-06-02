@@ -512,6 +512,8 @@ need_full_resync:
  * Returns C_OK on success or C_ERR otherwise. */
 int startBgsaveForReplication(int mincapa) {
     int retval;
+    // slave请求同步时，mincapa有SLAVE_CAPA_EOF 此标记
+    // repl_diskless_sync 是配置的参数 默认是0
     int socket_target = server.repl_diskless_sync && (mincapa & SLAVE_CAPA_EOF);
     listIter li;
     listNode *ln;
@@ -550,7 +552,8 @@ int startBgsaveForReplication(int mincapa) {
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
-
+            // psync 的时候已经设置了 SLAVE_STATE_WAIT_BGSAVE_START 状态
+            // 这里master给slave发送返回消息
             if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
                     replicationSetupSlaveForFullResync(slave,
                             getPsyncInitialOffset());
@@ -629,7 +632,7 @@ void syncCommand(client *c) {
     // [REPL SM 005-2] master收到psync命令, 准备进行全量同步, 设置slave得链接状态, 等待bgsave
     /* Setup the slave as one waiting for BGSAVE to start. The following code
      * paths will change the state if we handle the slave differently. */
-    c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+    c->replstate = SLAVE_STATE_WAIT_BGSAVE_START; // 设置等待bgsavestart状态
     if (server.repl_disable_tcp_nodelay)
         anetDisableTcpNoDelay(NULL, c->fd); /* Non critical if it fails. */
     c->repldbfd = -1;
@@ -689,6 +692,7 @@ void syncCommand(client *c) {
              * diskless replication) and we don't have a BGSAVE in progress,
              * let's start one. */
             if (server.aof_child_pid == -1) {
+                // [REPL SM 005-3] master收到psync命令, 准备进行全量同步, 开始bgsave
                 startBgsaveForReplication(c->slave_capa);
             } else {
                 serverLog(LL_NOTICE,
@@ -745,6 +749,7 @@ void replconfCommand(client *c) {
             }
         } else if (!strcasecmp(c->argv[j]->ptr,"capa")) {
             /* Ignore capabilities not understood by this master. */
+            // master会收到slave发送的配置capa命令 eof
             if (!strcasecmp(c->argv[j+1]->ptr,"eof"))
                 c->slave_capa |= SLAVE_CAPA_EOF;
         } else if (!strcasecmp(c->argv[j]->ptr,"ack")) {
@@ -1346,6 +1351,9 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
     // 根据master返回的内容分情况处理，
     // master 应该是在处理psync时传入的offset 来确定当前slave的同步进度，返回不同消息
     if (!strncmp(reply,"+FULLRESYNC",11)) {
+        // 收到master返回的全同步返回消息, 里面包含了master的 runid
+        // 见master执行 replicationSetupSlaveForFullResync 函数
+        // runid是master的一个启动时产生的随机字符串id
         char *runid = NULL, *offset = NULL;
 
         /* FULL RESYNC, parse the reply in order to extract the run id
@@ -1573,6 +1581,8 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
      * in the form of REPLCONF capa X capa Y capa Z ...
      * The master will ignore capabilities it does not understand. */
     if (server.repl_state == REPL_STATE_SEND_CAPA) {
+        // 注意这里会设置capa属性，master在处理bgsave的时候会使用这个字段
+        // master处理replconf命令接口 ： replconfCommand
         err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"REPLCONF",
                 "capa","eof",NULL);
         if (err) goto write_error;
@@ -1619,6 +1629,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     // 读取上面发送psync命令的结果，注意函数调用里读取到结果后会先删除read事件，即当前函数不会在被调用
+    // slave收到master返回的psync命令结果 FULLSYNC
     psync_result = slaveTryPartialResynchronization(fd,1);
     if (psync_result == PSYNC_WAIT_REPLY) return; /* Try again later... */
 
