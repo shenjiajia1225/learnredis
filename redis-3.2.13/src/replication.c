@@ -389,6 +389,8 @@ int replicationSetupSlaveForFullResync(client *slave, long long offset) {
     int buflen;
 
     slave->psync_initial_offset = offset;
+    // 注意这里会将slave得repl得state设置为等待bgsave结束
+    // 在时钟检测到bgsave结束后，会查找这个状态得slave，将rdb文件发送给slave
     slave->replstate = SLAVE_STATE_WAIT_BGSAVE_END;
     /* We are going to accumulate the incremental changes for this
      * slave as well. Set slaveseldb to -1 in order to force to re-emit
@@ -555,7 +557,7 @@ int startBgsaveForReplication(int mincapa) {
         while((ln = listNext(&li))) {
             client *slave = ln->value;
             // psync 的时候已经设置了 SLAVE_STATE_WAIT_BGSAVE_START 状态
-            // 这里master给slave发送返回消息
+            // 这里master给slave发送返回消息, 同时注意该函数会设置slave得replstate = END
             if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
                     replicationSetupSlaveForFullResync(slave,
                             getPsyncInitialOffset());
@@ -696,6 +698,7 @@ void syncCommand(client *c) {
              * let's start one. */
             if (server.aof_child_pid == -1) {
                 // [REPL SM 005-3] master收到psync命令, 准备进行全量同步, 开始bgsave
+                // 后面在时钟里面检查到bgsave命令完成后在执行后续处理 时钟函数在server.c serverCron
                 startBgsaveForReplication(c->slave_capa);
             } else {
                 serverLog(LL_NOTICE,
@@ -816,6 +819,7 @@ void putSlaveOnline(client *slave) {
 }
 
 void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
+    // master 将rdb文件内容发送给slave，只要slave得write事件满足就会调用到这里
     client *slave = privdata;
     UNUSED(el);
     UNUSED(mask);
@@ -825,6 +829,8 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Before sending the RDB file, we send the preamble as configured by the
      * replication process. Currently the preamble is just the bulk count of
      * the file in the form "$<length>\r\n". */
+    // 先给slave发送长度(rdb文件得size), 发送成功后会清除replpreamble数据,
+    // 后面开始发送rdb实际内容
     if (slave->replpreamble) {
         nwritten = write(fd,slave->replpreamble,sdslen(slave->replpreamble));
         if (nwritten == -1) {
@@ -894,13 +900,20 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
-        // 对每一个slave检查，slave在发送psync命令后已经设置过 SLAVE_STATE_WAIT_BGSAVE_START 状态了
+        // 对每一个slave检查，slave在发送psync命令后设置为 SLAVE_STATE_WAIT_BGSAVE_START 状态了
+        // 当master开始bgsave后会给slave返回消息，同时将slave得repl得state设置为 SLAVE_STATE_WAIT_BGSAVE_END
+        // 
+        // 当因slave触发psync命令导致master执行bgsave过程中，如果有其他slave也需要同步，只记录一个状态，设置要等待开始。
+        // 等到前一个bgsave结束后，这里在重新调度bgsave。
+        // bgsave完成后得 rdb文件名是否是同一个？如果前一个rdb文件正在被master打开同步发送给slave时，
+        // 另一个bgsave子进程结束会怎么样？
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
             // slave capa 在全量同步时设置过 SLAVE_CAPA_EOF = 1
             startbgsave = 1;
             mincapa = (mincapa == -1) ? slave->slave_capa :
                                         (mincapa & slave->slave_capa);
         } else if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END) {
+            // 找到需要同步数据得slave了
             struct redis_stat buf;
 
             /* If this was an RDB on disk save, we have to prepare to send
@@ -926,6 +939,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                     serverLog(LL_WARNING,"SYNC failed. BGSAVE child returned an error");
                     continue;
                 }
+                // 打开rdb文件，开启slave连接得write事件，准备将rdb文件内容发送给slave
                 if ((slave->repldbfd = open(server.rdb_filename,O_RDONLY)) == -1 ||
                     redis_fstat(slave->repldbfd,&buf) == -1) {
                     freeClient(slave);
@@ -934,7 +948,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 }
                 slave->repldboff = 0;
                 slave->repldbsize = buf.st_size;
-                slave->replstate = SLAVE_STATE_SEND_BULK;
+                slave->replstate = SLAVE_STATE_SEND_BULK; // 这里重新设置slave得repl得状态
                 slave->replpreamble = sdscatprintf(sdsempty(),"$%lld\r\n",
                     (unsigned long long) slave->repldbsize);
 
@@ -1680,6 +1694,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* Setup the non blocking download of the bulk file. */
     // 重新监听fd读事件，准备将master发来的同步数据写入tmpfile
+    // 收到master的全量同步后返回 PSYNC_FULLRESYNC 走到这里, 准备接受来自master的db数据
     if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
             == AE_ERR)
     {
