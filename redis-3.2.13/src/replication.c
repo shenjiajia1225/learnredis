@@ -514,6 +514,7 @@ int startBgsaveForReplication(int mincapa) {
     int retval;
     // slave请求同步时，mincapa有SLAVE_CAPA_EOF 此标记
     // repl_diskless_sync 是配置的参数 默认是0
+    // socket_target应该是远程同步的方式 一个是直接通过socket传送 一个是先保存成了文件在发送
     int socket_target = server.repl_diskless_sync && (mincapa & SLAVE_CAPA_EOF);
     listIter li;
     listNode *ln;
@@ -549,6 +550,7 @@ int startBgsaveForReplication(int mincapa) {
     /* If the target is socket, rdbSaveToSlavesSockets() already setup
      * the salves for a full resync. Otherwise for disk target do it now.*/
     if (!socket_target) {
+        // 遍历slave
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
@@ -637,6 +639,7 @@ void syncCommand(client *c) {
         anetDisableTcpNoDelay(NULL, c->fd); /* Non critical if it fails. */
     c->repldbfd = -1;
     c->flags |= CLIENT_SLAVE;
+    // 将当前连接加入到slave链表里
     listAddNodeTail(server.slaves,c);
 
     // 分情况处理，可能当前有正在备份得进程
@@ -891,8 +894,9 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
-
+        // 对每一个slave检查，slave在发送psync命令后已经设置过 SLAVE_STATE_WAIT_BGSAVE_START 状态了
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
+            // slave capa 在全量同步时设置过 SLAVE_CAPA_EOF = 1
             startbgsave = 1;
             mincapa = (mincapa == -1) ? slave->slave_capa :
                                         (mincapa & slave->slave_capa);
@@ -1630,6 +1634,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     // 读取上面发送psync命令的结果，注意函数调用里读取到结果后会先删除read事件，即当前函数不会在被调用
     // slave收到master返回的psync命令结果 FULLSYNC
+    // 全量同步返回 PSYNC_FULLRESYNC
     psync_result = slaveTryPartialResynchronization(fd,1);
     if (psync_result == PSYNC_WAIT_REPLY) return; /* Try again later... */
 
@@ -1674,6 +1679,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     /* Setup the non blocking download of the bulk file. */
+    // 重新监听fd读事件，准备将master发来的同步数据写入tmpfile
     if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
             == AE_ERR)
     {
@@ -1791,7 +1797,7 @@ void replicationSetMaster(char *ip, int port) {
     freeReplicationBacklog(); /* Don't allow our chained slaves to PSYNC. */
     cancelReplicationHandshake();
     server.repl_state = REPL_STATE_CONNECT;
-    server.master_repl_offset = 0;
+    server.master_repl_offset = 0; // 设置slave的offset
     server.repl_down_since = 0;
 }
 
