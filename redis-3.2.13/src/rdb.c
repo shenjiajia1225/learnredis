@@ -894,6 +894,10 @@ int rdbSave(char *filename) {
 
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
+    // 有没有这种可能，一个很大的db文件，第一个slave请求全量同步，生成了一个很大的rdb文件。
+    // 发送rdb文件(耗时比较长，可能是因为网络，可能文件太大），此时用户删除删了很多内容，
+    // 一个新的slave过来请求同步，子进程到这里很快结束了，但是前一个slave还打开了rdb文件正在传输内容
+    // 此时rename应该会失败？
     if (rename(tmpfile,filename) == -1) {
         char *cwdp = getcwd(cwd,MAXPATHLEN);
         serverLog(LL_WARNING,
@@ -1445,6 +1449,7 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
         server.lastsave = time(NULL);
         server.lastbgsave_status = C_OK;
     } else if (!bysignal && exitcode != 0) {
+        // 子进程savedb成功，但是在执行rename文件时失败了（老文件可能正在被其他slave打开）
         serverLog(LL_WARNING, "Background saving error");
         server.lastbgsave_status = C_ERR;
     } else {

@@ -656,6 +656,8 @@ void syncCommand(client *c) {
         listNode *ln;
         listIter li;
 
+        // 加入之前有个slave已经请求了全量同步，此时新的一个slave连接上来也请求同步（假如也是全量）
+        // 先找到之前请求同步的那个slave，根据slave的状态查找
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             slave = ln->value;
@@ -666,12 +668,16 @@ void syncCommand(client *c) {
         if (ln && ((c->slave_capa & slave->slave_capa) == slave->slave_capa)) {
             /* Perfect, the server is already registering differences for
              * another slave. Set the right state, and copy the buffer. */
+            // 找到后，将之前slave已经缓存的数据(bgsave过程中master又处理的命令)拷贝一份到自己的缓存中
             copyClientOutputBuffer(c,slave);
+            // 设置状态为等待BGSAVE结束, 回复一个消息 +FULLRESYNC
+            // 对于此slave的后续处理和之前的slave一样
             replicationSetupSlaveForFullResync(c,slave->psync_initial_offset);
             serverLog(LL_NOTICE,"Waiting for end of BGSAVE for SYNC");
         } else {
             /* No way, we need to wait for the next BGSAVE in order to
              * register differences. */
+            // 到这里要等待下一个BGSAVE开始, 可能是一个老版本的redis slave连接上来请求同步
             serverLog(LL_NOTICE,"Can't attach the slave to the current BGSAVE. Waiting for next BGSAVE for SYNC");
         }
 
@@ -756,6 +762,7 @@ void replconfCommand(client *c) {
         } else if (!strcasecmp(c->argv[j]->ptr,"capa")) {
             /* Ignore capabilities not understood by this master. */
             // master会收到slave发送的配置capa命令 eof
+            // 这个标记应该是老的redis没有此功能, 为了兼容新老redis
             if (!strcasecmp(c->argv[j+1]->ptr,"eof"))
                 c->slave_capa |= SLAVE_CAPA_EOF;
         } else if (!strcasecmp(c->argv[j]->ptr,"ack")) {
@@ -808,7 +815,9 @@ void putSlaveOnline(client *slave) {
     slave->replstate = SLAVE_STATE_ONLINE;
     slave->repl_put_online_on_ack = 0;
     slave->repl_ack_time = server.unixtime; /* Prevent false timeout. */
-    // 重新加入可write事件
+    // 重新加入可write事件, 注意这里在加入的原因是因为在bgsave期间 master可能也有其他命令正在执行
+    // 这部分命令被缓存到各个slave的缓冲区中，需要发送给slave
+    // 见 server.c propagate()
     if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
         sendReplyToClient, slave) == AE_ERR) {
         serverLog(LL_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
@@ -913,6 +922,9 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
         // 另一个bgsave子进程结束会怎么样？
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
             // slave capa 在全量同步时设置过 SLAVE_CAPA_EOF = 1
+            // 这里找到一个等待BGSAVE开始的slave是因为在刚结束的BGSAVE期间，一个新的slave
+            // 请求同步，但是又不能和之前的slave（产生bgsave的slave）合并处理, 见 syncCommand 处理
+            // 此时mincapa = 0
             startbgsave = 1;
             mincapa = (mincapa == -1) ? slave->slave_capa :
                                         (mincapa & slave->slave_capa);
@@ -939,6 +951,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 slave->repl_ack_time = server.unixtime; /* Timeout otherwise. */
             } else {
                 if (bgsaveerr != C_OK) {
+                    // 等待bgsave完成的slave，master在rename文件时发生了错误倒是bgsave失败了，断开连接
                     freeClient(slave);
                     serverLog(LL_WARNING,"SYNC failed. BGSAVE child returned an error");
                     continue;
@@ -966,6 +979,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
             }
         }
     }
+    // 在开启一个bgsave mincapa = 0, 因为一个老的slave请求
     if (startbgsave) startBgsaveForReplication(mincapa);
 }
 

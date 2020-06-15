@@ -905,6 +905,9 @@ int writeToClient(int fd, client *c, int handler_installed) {
     size_t objmem;
     robj *o;
 
+    // master 向 slave发送完成rdb后， handler_installed = 1
+    // 这里的client c 就是之前的 slave
+    // 这里要把之前缓存的其他命令数据发送给slave
     while(clientHasPendingReplies(c)) {
         if (c->bufpos > 0) {
             nwritten = write(fd,c->buf+c->sentlen,c->bufpos-c->sentlen);
@@ -972,6 +975,8 @@ int writeToClient(int fd, client *c, int handler_installed) {
         if (!(c->flags & CLIENT_MASTER)) c->lastinteraction = server.unixtime;
     }
     if (!clientHasPendingReplies(c)) {
+        // 发送完所有的缓存数据后断开连接
+        // TODO 后续的同步怎么进行 部分同步吗？
         c->sentlen = 0;
         if (handler_installed) aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
 
@@ -988,6 +993,7 @@ int writeToClient(int fd, client *c, int handler_installed) {
 void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);
+    // master向slave发送完rdb文件后，执行到这里，privdata就是 client *slave 对象
     writeToClient(fd,privdata,1);
 }
 
