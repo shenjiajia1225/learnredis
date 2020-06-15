@@ -804,15 +804,18 @@ void replconfCommand(client *c) {
  *    sending it to the slave.
  * 3) Update the count of good slaves. */
 void putSlaveOnline(client *slave) {
+    // 设置slave的状态为online
     slave->replstate = SLAVE_STATE_ONLINE;
     slave->repl_put_online_on_ack = 0;
     slave->repl_ack_time = server.unixtime; /* Prevent false timeout. */
+    // 重新加入可write事件
     if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE,
         sendReplyToClient, slave) == AE_ERR) {
         serverLog(LL_WARNING,"Unable to register writable event for slave bulk transfer: %s", strerror(errno));
         freeClient(slave);
         return;
     }
+    // 刷新一下good的slave数量
     refreshGoodSlavesCount();
     serverLog(LL_NOTICE,"Synchronization with slave %s succeeded",
         replicationGetSlaveName(slave));
@@ -867,9 +870,10 @@ void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         return;
     }
-    slave->repldboff += nwritten;
+    slave->repldboff += nwritten; // 记录已经发送的数据
     server.stat_net_output_bytes += nwritten;
     if (slave->repldboff == slave->repldbsize) {
+        // 到这里表示rdb文件全部同步发送完成了, 关闭文件，移除write事件
         close(slave->repldbfd);
         slave->repldbfd = -1;
         aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
@@ -948,10 +952,12 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 }
                 slave->repldboff = 0;
                 slave->repldbsize = buf.st_size;
-                slave->replstate = SLAVE_STATE_SEND_BULK; // 这里重新设置slave得repl得状态
+                // 这里重新设置slave得repl得状态
+                slave->replstate = SLAVE_STATE_SEND_BULK;
                 slave->replpreamble = sdscatprintf(sdsempty(),"$%lld\r\n",
                     (unsigned long long) slave->repldbsize);
 
+                // 添加写事件，将rdb文件内容发送给远端slave
                 aeDeleteFileEvent(server.el,slave->fd,AE_WRITABLE);
                 if (aeCreateFileEvent(server.el, slave->fd, AE_WRITABLE, sendBulkToSlave, slave) == AE_ERR) {
                     freeClient(slave);
