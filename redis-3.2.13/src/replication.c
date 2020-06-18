@@ -28,6 +28,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * 1. 主备同步流程，全量同步
+ * 2. 全量同步完成后得增量同步
+ *      master处理完命令后 server.call 调用 server.propagate 将命令发送给各个slave
+ * 3. 主备断开连接后得处理
+ * 4. 主备切换(master down)
+ *
+ * server.call 执行所有命令入口
+ */
 
 #include "server.h"
 
@@ -1342,6 +1351,8 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         // 发送 PSYNC 命令，主要需要一个offset, 和 一个runid
         // 首次同步时 没有cached_master 。 即没有 runid = ? 和 offset = -1
         // master 处理消息在 syncCommand 中
+        //
+        // 后续同步时，使用增量同步 需要cached_master
 
         /* Initially set repl_master_initial_offset to -1 to mark the current
          * master run_id and offset as not valid. Later if we'll be able to do

@@ -897,7 +897,8 @@ int rdbSave(char *filename) {
     // 有没有这种可能，一个很大的db文件，第一个slave请求全量同步，生成了一个很大的rdb文件。
     // 发送rdb文件(耗时比较长，可能是因为网络，可能文件太大），此时用户删除删了很多内容，
     // 一个新的slave过来请求同步，子进程到这里很快结束了，但是前一个slave还打开了rdb文件正在传输内容
-    // 此时rename应该会失败？
+    // 此时rename应该会失败？ 如果被打开的filename比较小的话 这里的rename会成功，如果比较大的话rename就是失败。
+    // 程序测试结果，要从kernel里查下.
     if (rename(tmpfile,filename) == -1) {
         char *cwdp = getcwd(cwd,MAXPATHLEN);
         serverLog(LL_WARNING,
