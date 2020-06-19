@@ -84,6 +84,7 @@ char *replicationGetSlaveName(client *c) {
 /* ---------------------------------- MASTER -------------------------------- */
 
 void createReplicationBacklog(void) {
+    // 第一个slave连上来 请求psync同步数据后 会创建backlog
     serverAssert(server.repl_backlog == NULL);
     server.repl_backlog = zmalloc(server.repl_backlog_size);
     server.repl_backlog_histlen = 0;
@@ -138,12 +139,16 @@ void freeReplicationBacklog(void) {
  * server.master_repl_offset, because there is no case where we want to feed
  * the backlog without incrementing the buffer. */
 void feedReplicationBacklog(void *ptr, size_t len) {
+    // 这里是要将ptr, ptr+len 的内容cp到repl_backlog缓冲区中
     unsigned char *p = ptr;
 
+    // 最开始 master_repl_offset = 1, 在创建repl_backlog时设置为1
     server.master_repl_offset += len;
 
     /* This is a circular buffer, so write as much data we can at every
      * iteration and rewind the "idx" index if we reach the limit. */
+    // repl_backlog_idx时下个可以写入数据的缓冲区索引
+    // repl_backlog_histlen 实际repl_backlog 内数据长度, 当circularbuffer绕回来后 此值应该就一直保持不变了
     while(len) {
         size_t thislen = server.repl_backlog_size - server.repl_backlog_idx;
         if (thislen > len) thislen = len;
@@ -193,6 +198,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     serverAssert(!(listLength(slaves) != 0 && server.repl_backlog == NULL));
 
     /* Send SELECT command to every slave if needed. */
+    // slave选择的db 和 当前命令使用的db不一致时 要给slave发送一个select db命令
     if (server.slaveseldb != dictid) {
         robj *selectcmd;
 
@@ -216,7 +222,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         listRewind(slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
-            if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue;
+            if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) continue; // 跳过正在等待开始同步的slave
             addReply(slave,selectcmd);
         }
 
@@ -227,6 +233,8 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
 
     /* Write the command to the replication backlog if any. */
     if (server.repl_backlog) {
+        // 当有slave连接上来后就会创建repl_backlog, 处理普通命令后需要将命令发送给slave
+        // 这里先写repl_backlog
         char aux[LONG_STR_SIZE+3];
 
         /* Add the multi bulk reply length. */
@@ -370,9 +378,12 @@ long long addReplyReplicationBacklog(client *c, long long offset) {
  * the BGSAVE process started and before executing any other command
  * from clients. */
 long long getPsyncInitialOffset(void) {
+    // 返回master的 复制数据长度
     long long psync_offset = server.master_repl_offset;
     /* Add 1 to psync_offset if it the replication backlog does not exists
      * as when it will be created later we'll increment the offset by one. */
+    // syncCommand 调用过程中，会先调用到 startBgsaveForReplication ，进而调用到这里，此时master_repl_offset=0
+    // 但是在随后的调用中，createReplicationBacklog 会将master_repl_offset = 1
     if (server.repl_backlog == NULL) psync_offset++;
     return psync_offset;
 }
@@ -723,6 +734,7 @@ void syncCommand(client *c) {
         }
     }
 
+    // 当收到第一个slave连接的psync命令后，会创建repl_backlog
     if (listLength(server.slaves) == 1 && server.repl_backlog == NULL)
         createReplicationBacklog();
     return;
@@ -1030,9 +1042,10 @@ void replicationEmptyDbCallback(void *privdata) {
  * performed, this function materializes the master client we store
  * at server.master, starting from the specified file descriptor. */
 void replicationCreateMasterClient(int fd) {
+    // 保存连接的master数据
     server.master = createClient(fd);
-    server.master->flags |= CLIENT_MASTER;
-    server.master->authenticated = 1;
+    server.master->flags |= CLIENT_MASTER; // 标记为master
+    server.master->authenticated = 1; // 已认证
     server.repl_state = REPL_STATE_CONNECTED;
     server.master->reploff = server.repl_master_initial_offset;
     memcpy(server.master->replrunid, server.repl_master_runid,
@@ -1053,6 +1066,8 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(privdata);
     UNUSED(mask);
 
+    // 收到master发来的全量同步的 rdb文件内容
+
     /* Static vars used to hold the EOF mark, and the last bytes received
      * form the server: when they match, we reached the end of the transfer. */
     static char eofmark[CONFIG_RUN_ID_SIZE];
@@ -1061,6 +1076,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* If repl_transfer_size == -1 we still have to read the bulk length
      * from the master reply. */
+    // 先要读取一个总长度
     if (server.repl_transfer_size == -1) {
         if (syncReadLine(fd,buf,1024,server.repl_syncio_timeout*1000) == -1) {
             serverLog(LL_WARNING,
@@ -1105,6 +1121,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
             serverLog(LL_NOTICE,
                 "MASTER <-> SLAVE sync: receiving streamed RDB from master");
         } else {
+            // 读取到即将接受的rdb文件的总长度 后续已usemark=0为例
             usemark = 0;
             server.repl_transfer_size = strtol(buf+1,NULL,10);
             serverLog(LL_NOTICE,
@@ -1115,6 +1132,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 
     /* Read bulk data */
+    // 读取后续rdb文件内容
     if (usemark) {
         readlen = sizeof(buf);
     } else {
@@ -1122,6 +1140,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         readlen = (left < (signed)sizeof(buf)) ? left : (signed)sizeof(buf);
     }
 
+    // 读数据
     nread = read(fd,buf,readlen);
     if (nread <= 0) {
         serverLog(LL_WARNING,"I/O error trying to sync with MASTER: %s",
@@ -1147,6 +1166,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         if (memcmp(lastbytes,eofmark,CONFIG_RUN_ID_SIZE) == 0) eof_reached = 1;
     }
 
+    // 写入文件内
     server.repl_transfer_lastio = server.unixtime;
     if (write(server.repl_transfer_fd,buf,nread) != nread) {
         serverLog(LL_WARNING,"Write error or short write writing to the DB dump file needed for MASTER <-> SLAVE synchronization: %s", strerror(errno));
@@ -1180,10 +1200,11 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Check if the transfer is now complete */
     if (!usemark) {
         if (server.repl_transfer_read == server.repl_transfer_size)
-            eof_reached = 1;
+            eof_reached = 1; // 读取到所有master上 rdb 文件的数据内容了
     }
 
     if (eof_reached) {
+        // 读完数据了
         if (rename(server.repl_transfer_tmpfile,server.rdb_filename) == -1) {
             serverLog(LL_WARNING,"Failed trying to rename the temp DB into dump.rdb in MASTER <-> SLAVE synchronization: %s", strerror(errno));
             cancelReplicationHandshake();
@@ -1196,6 +1217,7 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
          * handler, otherwise it will get called recursively since
          * rdbLoad() will call the event loop to process events from time to
          * time for non blocking loading. */
+        // 删除读事件, 加载db文件内容
         aeDeleteFileEvent(server.el,server.repl_transfer_s,AE_READABLE);
         serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Loading DB in memory");
         if (rdbLoad(server.rdb_filename) != C_OK) {
@@ -1206,6 +1228,8 @@ void readSyncBulkPayload(aeEventLoop *el, int fd, void *privdata, int mask) {
         /* Final setup of the connected slave <- master link */
         zfree(server.repl_transfer_tmpfile);
         close(server.repl_transfer_fd);
+        // 全量同步master的rdb文件完成后, 将此master连接保存
+        // repl_transfer_s 是slave之前连接master的 socket fd
         replicationCreateMasterClient(server.repl_transfer_s);
         serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Finished with success");
         /* Restart the AOF subsystem now that we finished the sync. This
@@ -1424,7 +1448,7 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
         } else {
             memcpy(server.repl_master_runid, runid, offset-runid-1);
             server.repl_master_runid[CONFIG_RUN_ID_SIZE] = '\0';
-            server.repl_master_initial_offset = strtoll(offset,NULL,10);
+            server.repl_master_initial_offset = strtoll(offset,NULL,10); // 获取 master 发送过来的offset(getPsyncInitialOffset) 设置到本地
             serverLog(LL_NOTICE,"Full resync from master: %s:%lld",
                 server.repl_master_runid,
                 server.repl_master_initial_offset);
@@ -1680,17 +1704,20 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     // 读取上面发送psync命令的结果，注意函数调用里读取到结果后会先删除read事件，即当前函数不会在被调用
     // slave收到master返回的psync命令结果 FULLSYNC
     // 全量同步返回 PSYNC_FULLRESYNC
+    // 如果是增量同步，返回 PSYNC_CONTINUE, 注意函数调用内部会处理continue的逻辑处理
+    // 如果返回了PSYNC_WAIT_REPLY, 表示master返回的数据还没收全
     psync_result = slaveTryPartialResynchronization(fd,1);
     if (psync_result == PSYNC_WAIT_REPLY) return; /* Try again later... */
 
     /* Note: if PSYNC does not return WAIT_REPLY, it will take care of
      * uninstalling the read handler from the file descriptor. */
-
+    // continue情况下 在 slaveTryPartialResynchronization 调用里已经有处理了
     if (psync_result == PSYNC_CONTINUE) {
         serverLog(LL_NOTICE, "MASTER <-> SLAVE sync: Master accepted a Partial Resynchronization.");
         return;
     }
 
+    // 下面是全量同步逻辑的后续处理
     /* PSYNC failed or is not supported: we want our slaves to resync with us
      * as well, if we have any (chained replication case). The mater may
      * transfer us an entirely different data set and we have no way to
@@ -1726,6 +1753,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Setup the non blocking download of the bulk file. */
     // 重新监听fd读事件，准备将master发来的同步数据写入tmpfile
     // 收到master的全量同步后返回 PSYNC_FULLRESYNC 走到这里, 准备接受来自master的db数据
+    // 全量数据准备写入dfd的文件中
     if (aeCreateFileEvent(server.el,fd, AE_READABLE,readSyncBulkPayload,NULL)
             == AE_ERR)
     {

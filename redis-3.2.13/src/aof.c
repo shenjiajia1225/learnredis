@@ -520,6 +520,7 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
 
     /* The DB this command was targeting is not the same as the last command
      * we appended. To issue a SELECT command is needed. */
+    // db不一致时需要插入一条select db的命令
     if (dictid != server.aof_selected_db) {
         char seldb[64];
 
@@ -565,7 +566,7 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
     }
 
     // 上面根据不同命令，将命令及参数写入到buf中
-    // 开启aof后，将buf追加到aof_buf中
+    // 开启aof后，将buf追加到aof_buf中, aof_buf在定时任务 serverCron 中被写入到aof文件中
 
     /* Append to the AOF buffer. This will be flushed on disk just before
      * of re-entering the event loop, so before the client will get a

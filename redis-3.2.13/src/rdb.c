@@ -931,6 +931,7 @@ int rdbSaveBackground(char *filename) {
 
     if (server.aof_child_pid != -1 || server.rdb_child_pid != -1) return C_ERR;
 
+    // 这里先保存下 save 前得 dirty数，即又多少条cmd数据没有被保存
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
@@ -1446,6 +1447,7 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
     if (!bysignal && exitcode == 0) {
         serverLog(LL_NOTICE,
             "Background saving terminated with success");
+        // dbsave成功后，更新下dirty数量，最新得dirty数量为在保存db文件期间执行得cmd条数
         server.dirty = server.dirty - server.dirty_before_bgsave;
         server.lastsave = time(NULL);
         server.lastbgsave_status = C_OK;

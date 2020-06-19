@@ -2163,9 +2163,9 @@ void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
 {
     // 将客户端命令写入aof 和 各个slave
     if (server.aof_state != AOF_OFF && flags & PROPAGATE_AOF)
-        feedAppendOnlyFile(cmd,dbid,argv,argc);
+        feedAppendOnlyFile(cmd,dbid,argv,argc); // 写入aof
     if (flags & PROPAGATE_REPL)
-        replicationFeedSlaves(server.slaves,dbid,argv,argc);
+        replicationFeedSlaves(server.slaves,dbid,argv,argc); // 将命令写入到slave中
 }
 
 /* Used inside commands to schedule the propagation of additional commands
@@ -2259,6 +2259,7 @@ void preventCommandReplication(client *c) {
  *
  */
 void call(client *c, int flags) {
+    // 用户执行命令 call 进来时 flags = CMD_CALL_FULL
     long long dirty, start, duration;
     int client_old_flags = c->flags;
 
@@ -2277,11 +2278,12 @@ void call(client *c, int flags) {
     redisOpArrayInit(&server.also_propagate);
 
     /* Call the command. */
+    // server.dirty 相当于执行了多少条cmd了(未保存到db文件中), 当完成一次bgsave后会更新新得dirty值
     dirty = server.dirty;
     start = ustime();
     c->cmd->proc(c); // 处理命令
     duration = ustime()-start;
-    dirty = server.dirty-dirty;
+    dirty = server.dirty-dirty; // 处理完命令后dirty值会改变(如果有命令强制写db的话会导致dirty变小，因此可能会<0)
     if (dirty < 0) dirty = 0;
 
     /* When EVAL is called loading the AOF we don't want commands called
@@ -2313,6 +2315,8 @@ void call(client *c, int flags) {
     }
 
     /* Propagate the command into the AOF and replication link */
+    // 用户命令调用时 flags = CMD_CALL_FULL
+    // 没有阻止propagate
     if (flags & CMD_CALL_PROPAGATE &&
         (c->flags & CLIENT_PREVENT_PROP) != CLIENT_PREVENT_PROP)
     {
@@ -2320,6 +2324,7 @@ void call(client *c, int flags) {
 
         /* Check if the command operated changes in the data set. If so
          * set for replication / AOF propagation. */
+        // 当此命令导致dirty增大时,表示产生了新的未保存的命令, 需要同步复制
         if (dirty) propagate_flags |= (PROPAGATE_AOF|PROPAGATE_REPL);
 
         /* If the client forced AOF / replication of the command, set
@@ -2339,6 +2344,7 @@ void call(client *c, int flags) {
 
         /* Call propagate() only if at least one of AOF / replication
          * propagation is needed. */
+        // 准备将此用户命令传播propagate给aof或是slave
         if (propagate_flags != PROPAGATE_NONE)
             propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
     }
