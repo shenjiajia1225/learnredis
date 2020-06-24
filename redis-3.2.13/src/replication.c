@@ -39,6 +39,8 @@
  *
  * 5. 正常状态下1主多从且运行很长时间后，新增一台slave得流程 (repl_backlog ), 过程同1
  *
+ * 6. 无盘备份 socket模式
+ *
  * server.call 执行所有命令入口
  */
 
@@ -828,11 +830,13 @@ void replconfCommand(client *c) {
             /* REPLCONF ACK is used by slave to inform the master the amount
              * of replication stream that it processed so far. It is an
              * internal only command that normal clients should never use. */
+            // master收到 slave定时发来的 REPLCONF ACK off 消息
             long long offset;
 
             if (!(c->flags & CLIENT_SLAVE)) return;
             if ((getLongLongFromObject(c->argv[j+1], &offset) != C_OK))
                 return;
+            // 缓存记录slave的数据同步偏移量
             if (offset > c->repl_ack_off)
                 c->repl_ack_off = offset;
             c->repl_ack_time = server.unixtime;
@@ -1508,10 +1512,11 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
 
     if (!strncmp(reply,"+CONTINUE",9)) {
         /* Partial resync was accepted, set the replication state accordingly */
+        // slave收到master对PSYNC回复，可以继续同步
         serverLog(LL_NOTICE,
             "Successful partial resynchronization with master.");
         sdsfree(reply);
-        // 将此fd加入到监听队列中，接受master来的数据
+        // 将此fd加入到监听队列中，接受master来的数据, 注意接收到的数据 都要更新自己的reploff值，以前同步时需要
         replicationResurrectCachedMaster(fd);
         return PSYNC_CONTINUE;
     }
@@ -2144,6 +2149,7 @@ void replicationDiscardCachedMaster(void) {
  * so the stream of data that we'll receive will start from were this
  * master left. */
 void replicationResurrectCachedMaster(int newfd) {
+    // 重新设置master信息
     server.master = server.cached_master;
     server.cached_master = NULL;
     server.master->fd = newfd;
@@ -2153,6 +2159,8 @@ void replicationResurrectCachedMaster(int newfd) {
     server.repl_state = REPL_STATE_CONNECTED;
 
     /* Re-add to the list of clients. */
+    // 加入读事件，可以接受来自master的数据，注意 readQueryFromClient 调用时 如果是来自master的数据，
+    // 大部分都是数据同步，因此需要修改自己当前已同步的数据偏移量reploff
     listAddNodeTail(server.clients,server.master);
     if (aeCreateFileEvent(server.el, newfd, AE_READABLE,
                           readQueryFromClient, server.master)) {
@@ -2485,6 +2493,7 @@ void replicationCron(void) {
     robj *ping_argv[1];
 
     /* First, send PING according to ping_slave_period. */
+    // master 主动发送ping给slave
     if ((replication_cron_loops % server.repl_ping_slave_period) == 0) {
         ping_argv[0] = createStringObject("PING",4);
         replicationFeedSlaves(server.slaves, server.slaveseldb,
