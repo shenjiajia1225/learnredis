@@ -798,6 +798,7 @@ void freeClient(client *c) {
                           CLIENT_BLOCKED|
                           CLIENT_UNBLOCKED)))
         {
+            // slave 和 master断开了连接，slave这段将master数据保存到master_cache
             replicationCacheMaster(c);
             return;
         }
