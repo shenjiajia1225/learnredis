@@ -503,8 +503,12 @@ struct evictionPoolEntry {
  * by integers from 0 (the default database) up to the max configured
  * database. The database number is the 'id' field in the structure. */
 typedef struct redisDb {
+    // 一个hash表，存放所有数据
     dict *dict;                 /* The keyspace for this DB */
+    // dict所有key的过期时间hash表
     dict *expires;              /* Timeout of keys with a timeout set */
+    // 下面两个 t_list.c signalListAsReady 中使用，从block到ready
+    // 用来处理阻塞读指定key的list数据. BLPOP/BRPOP
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
     dict *ready_keys;           /* Blocked keys that received a PUSH */
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */

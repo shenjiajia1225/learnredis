@@ -686,6 +686,8 @@ void unblockClientWaitingData(client *c) {
  * The list will be finally processed by handleClientsBlockedOnLists() */
 void signalListAsReady(redisDb *db, robj *key) {
     readyList *rl;
+    // 注意这里只是将block中的key给加到了ready中，但是block中的没有删除
+    // TODO 为什么不删???
 
     /* No clients blocking for this key? No need to queue it. */
     if (dictFind(db->blocking_keys,key) == NULL) return;

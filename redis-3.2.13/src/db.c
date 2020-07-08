@@ -45,6 +45,7 @@ void slotToKeyFlush(void);
  * implementations that should instead rely on lookupKeyRead(),
  * lookupKeyWrite() and lookupKeyReadWithFlags(). */
 robj *lookupKey(redisDb *db, robj *key, int flags) {
+    // flags = LOOKUP_NONE 普通查找触发如: set key val ...
     dictEntry *de = dictFind(db->dict,key->ptr);
     if (de) {
         robj *val = dictGetVal(de);
@@ -52,6 +53,7 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
+        // TODO 触发了copyon write 会怎么样？
         if (server.rdb_child_pid == -1 &&
             server.aof_child_pid == -1 &&
             !(flags & LOOKUP_NOTOUCH))
@@ -86,8 +88,10 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
  * correctly report a key is expired on slaves even if the master is lagging
  * expiring our key via DELs in the replication link. */
 robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
+    // 一般情况下 flags = LOOKUP_NONE, 正常使用get 命令等
     robj *val;
 
+    // 过期的时候要区分当前是否时master/slave,以及这表命令的来源
     if (expireIfNeeded(db,key) == 1) {
         /* Key expired. If we are in the context of a master, expireIfNeeded()
          * returns 0 only when the key does not exist at all, so it's safe
@@ -134,11 +138,13 @@ robj *lookupKeyRead(redisDb *db, robj *key) {
  * Returns the linked value object if the key exists or NULL if the key
  * does not exist in the specified DB. */
 robj *lookupKeyWrite(redisDb *db, robj *key) {
+    // 先检查是否过期 在查询
     expireIfNeeded(db,key);
     return lookupKey(db,key,LOOKUP_NONE);
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
+    // 这里不需要检查过期吗 （在内部调用时会有检查）
     robj *o = lookupKeyRead(c->db, key);
     if (!o) addReply(c,reply);
     return o;
@@ -159,6 +165,9 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     int retval = dictAdd(db->dict, copy, val);
 
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
+    // 针对value是list，可能存在block / ready 两个队列,需要处理
+    // 将被block的key 移到ready的队列里
+    // 对一个list进行阻塞读的时候，会需要block队列
     if (val->type == OBJ_LIST) signalListAsReady(db, key);
     if (server.cluster_enabled) slotToKeyAdd(key);
  }
@@ -182,6 +191,7 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
  * 2) clients WATCHing for the destination key notified.
  * 3) The expire time of the key is reset (the key is made persistent). */
 void setKey(redisDb *db, robj *key, robj *val) {
+    // 区分当前key是否存在
     if (lookupKeyWrite(db,key) == NULL) {
         dbAdd(db,key,val);
     } else {
@@ -859,6 +869,7 @@ void setExpire(redisDb *db, robj *key, long long when) {
 long long getExpire(redisDb *db, robj *key) {
     dictEntry *de;
 
+    // 从db的expires的hash表中查key对应的expire数据
     /* No expire? return ASAP */
     if (dictSize(db->expires) == 0 ||
        (de = dictFind(db->expires,key->ptr)) == NULL) return -1;
@@ -880,13 +891,15 @@ long long getExpire(redisDb *db, robj *key) {
 void propagateExpire(redisDb *db, robj *key) {
     robj *argv[2];
 
-    argv[0] = shared.del;
+    argv[0] = shared.del; // 公共的DEL命令对象
     argv[1] = key;
     incrRefCount(argv[0]);
     incrRefCount(argv[1]);
 
+    // 命令记入aof文件
     if (server.aof_state != AOF_OFF)
         feedAppendOnlyFile(server.delCommand,db->id,argv,2);
+    // 将此命令同步给slave
     replicationFeedSlaves(server.slaves,db->id,argv,2);
 
     decrRefCount(argv[0]);
@@ -894,6 +907,7 @@ void propagateExpire(redisDb *db, robj *key) {
 }
 
 int expireIfNeeded(redisDb *db, robj *key) {
+    // 检查key是否过期
     mstime_t when = getExpire(db,key);
     mstime_t now;
 
@@ -916,6 +930,7 @@ int expireIfNeeded(redisDb *db, robj *key) {
      * Still we try to return the right information to the caller,
      * that is, 0 if we think the key should be still valid, 1 if
      * we think the key is expired at this time. */
+    // slave节点只需要返回当前key是否已经过期即可，不需要处理过期的key(由master通知del)
     if (server.masterhost != NULL) return now > when;
 
     /* Return when this key has not expired */
@@ -923,9 +938,12 @@ int expireIfNeeded(redisDb *db, robj *key) {
 
     /* Delete the key */
     server.stat_expiredkeys++;
+    // 过期命令准备写aof和同步给slave
     propagateExpire(db,key);
+    // 发布订阅的消息
     notifyKeyspaceEvent(NOTIFY_EXPIRED,
         "expired",key,db->id);
+    // 删除
     return dbDelete(db,key);
 }
 

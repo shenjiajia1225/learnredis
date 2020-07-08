@@ -68,6 +68,7 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
     long long milliseconds = 0; /* initialized to avoid any harmness warning */
 
     if (expire) {
+        // 从expire中获取过期ms时间，获取失败时会给client发送消息
         if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != C_OK)
             return;
         if (milliseconds <= 0) {
@@ -77,12 +78,14 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         if (unit == UNIT_SECONDS) milliseconds *= 1000;
     }
 
+    // 处理not exist 和 exist 时key存在情况
     if ((flags & OBJ_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
         (flags & OBJ_SET_XX && lookupKeyWrite(c->db,key) == NULL))
     {
         addReply(c, abort_reply ? abort_reply : shared.nullbulk);
         return;
     }
+    // 设置key和expire
     setKey(c->db,key,val);
     server.dirty++;
     if (expire) setExpire(c->db,key,mstime()+milliseconds);
@@ -169,13 +172,19 @@ int getGenericCommand(client *c) {
     }
 }
 
+// GET 命令
 void getCommand(client *c) {
     getGenericCommand(c);
 }
 
+// 命令 GETSET key value
+// 将给定 key 的值设为 value ，并返回 key 的旧值(old value)
 void getsetCommand(client *c) {
+    // 先get旧值 并添加reply
     if (getGenericCommand(c) == C_ERR) return;
+    // 设置新值
     c->argv[2] = tryObjectEncoding(c->argv[2]);
+    // db.c
     setKey(c->db,c->argv[1],c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[1],c->db->id);
     server.dirty++;
