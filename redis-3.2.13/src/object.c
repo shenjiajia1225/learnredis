@@ -440,6 +440,8 @@ robj *tryObjectEncoding(robj *o) {
 robj *getDecodedObject(robj *o) {
     robj *dec;
 
+    // 用来返回一个字符串形式的robj 只支持本身就是string 或是int形式的robj
+    // #define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
     if (sdsEncodedObject(o)) {
         incrRefCount(o);
         return o;

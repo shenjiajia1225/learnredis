@@ -190,6 +190,8 @@ void getsetCommand(client *c) {
     server.dirty++;
 }
 
+//SETRANGE[0] key[1] offset[1] value[2]
+//用 value 参数覆写(overwrite)给定 key 所储存的字符串值，从偏移量 offset 开始
 void setrangeCommand(client *c) {
     robj *o;
     long offset;
@@ -236,6 +238,8 @@ void setrangeCommand(client *c) {
             return;
 
         /* Create a copy when the object is shared or encoded. */
+        // 因为原来的o可能是一个int数字, 这里要进行追加写内容，因此要对o转换
+        // 将原来int型转为string
         o = dbUnshareStringValue(c->db,c->argv[1],o);
     }
 
@@ -250,6 +254,8 @@ void setrangeCommand(client *c) {
     addReplyLongLong(c,sdslen(o->ptr));
 }
 
+//GETRANGE key start end
+//返回 key 中字符串值的子字符串，字符串的截取范围由 start 和 end 两个偏移量决定(包括 start 和 end 在内)。
 void getrangeCommand(client *c) {
     robj *o;
     long long start, end;

@@ -275,6 +275,10 @@ int dbDelete(redisDb *db, robj *key) {
 robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
     serverAssert(o->type == OBJ_STRING);
     if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
+        // 当前的o不是一个string 或者 被其他引用了
+        // o如果本身就是string 只是被引用了 返回的decoded==o 只是引用计数++
+        // o如果不是string, decoded是一个新的obj 内容用string形式来表示int
+        // 这里的函数主要用来转换一个非string的value变成一个strig形式的value, 并重新设置回key
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
         decrRefCount(decoded);
