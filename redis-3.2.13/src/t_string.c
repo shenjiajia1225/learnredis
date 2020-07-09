@@ -297,6 +297,8 @@ void getrangeCommand(client *c) {
     }
 }
 
+// MGET key [key ...]
+// 返回所有(一个或多个)给定 key 的值
 void mgetCommand(client *c) {
     int j;
 
@@ -324,6 +326,7 @@ void msetGenericCommand(client *c, int nx) {
     }
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
      * set nothing at all if at least one already key exists. */
+    // 只要有一个key对应的value存在就不执行
     if (nx) {
         for (j = 1; j < c->argc; j += 2) {
             if (lookupKeyWrite(c->db,c->argv[j]) != NULL) {
@@ -345,10 +348,14 @@ void msetGenericCommand(client *c, int nx) {
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
+// MSET key value [key value ...]
+// 同时设置一个或多个 key-value 对。
 void msetCommand(client *c) {
     msetGenericCommand(c,0);
 }
 
+// MSETNX key value [key value ...]
+// 同时设置一个或多个 key-value 对，当且仅当所有给定 key 都不存在。
 void msetnxCommand(client *c) {
     msetGenericCommand(c,1);
 }
@@ -358,9 +365,11 @@ void incrDecrCommand(client *c, long long incr) {
     robj *o, *new;
 
     o = lookupKeyWrite(c->db,c->argv[1]);
+    // o 可能 == null, 此时value=0
     if (o != NULL && checkType(c,o,OBJ_STRING)) return;
     if (getLongLongFromObjectOrReply(c,o,&value,NULL) != C_OK) return;
 
+    // 不支持绕回
     oldvalue = value;
     if ((incr < 0 && oldvalue < 0 && incr < (LLONG_MIN-oldvalue)) ||
         (incr > 0 && oldvalue > 0 && incr > (LLONG_MAX-oldvalue))) {
@@ -369,13 +378,23 @@ void incrDecrCommand(client *c, long long incr) {
     }
     value += incr;
 
+    // #define OBJ_SHARED_INTEGERS 10000
+    // redis缓存了 10000 以内的数据 shared.integers
+    // 要区分下新的value值是否满足可以使用shared.integers 数据
     if (o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
         (value < 0 || value >= OBJ_SHARED_INTEGERS) &&
         value >= LONG_MIN && value <= LONG_MAX)
     {
+        // o->refcount == 1 表示不是一个共享对象，本身共享对象ref=1，被o使用时 ref至少是2的
+        // 新的值也不满足使用共享变量
+        // 当前o不是一个share对象，直接修改值就行了.
         new = o;
         o->ptr = (void*)((long)value);
     } else {
+        // createStringObjectFromLongLong 会尝试根据value取shared里面的整数值
+        // 如果o本来是一个share对象，但是value不满足共享对象了
+        // new就是一个新create的对象，o这个对象不管了，这里的引用计数没被-1 . 
+        // 可能因为share对象本身不用考虑被释放的情况
         new = createStringObjectFromLongLong(value);
         if (o) {
             dbOverwrite(c->db,c->argv[1],new);
@@ -391,14 +410,20 @@ void incrDecrCommand(client *c, long long incr) {
     addReply(c,shared.crlf);
 }
 
+// INCR key
+// 将 key 中储存的数字值增一
 void incrCommand(client *c) {
     incrDecrCommand(c,1);
 }
 
+// DECR key
+// 将 key 中储存的数字值减一。
 void decrCommand(client *c) {
     incrDecrCommand(c,-1);
 }
 
+// INCRBY key increment
+// 将 key 所储存的值加上增量 increment
 void incrbyCommand(client *c) {
     long long incr;
 
@@ -406,6 +431,8 @@ void incrbyCommand(client *c) {
     incrDecrCommand(c,incr);
 }
 
+// DECRBY key decrement
+// 将 key 所储存的值减去减量 decrement
 void decrbyCommand(client *c) {
     long long incr;
 
@@ -413,11 +440,14 @@ void decrbyCommand(client *c) {
     incrDecrCommand(c,-incr);
 }
 
+// INCRBYFLOAT key increment
+// 为 key 中所储存的值加上浮点数增量 increment
 void incrbyfloatCommand(client *c) {
     long double incr, value;
     robj *o, *new, *aux;
 
     o = lookupKeyWrite(c->db,c->argv[1]);
+    // checkType 相同返回0 不同返回1
     if (o != NULL && checkType(c,o,OBJ_STRING)) return;
     if (getLongDoubleFromObjectOrReply(c,o,&value,NULL) != C_OK ||
         getLongDoubleFromObjectOrReply(c,c->argv[2],&incr,NULL) != C_OK)
@@ -441,12 +471,17 @@ void incrbyfloatCommand(client *c) {
     /* Always replicate INCRBYFLOAT as a SET command with the final value
      * in order to make sure that differences in float precision or formatting
      * will not create differences in replicas or after an AOF restart. */
+    // TODO 下面逻辑的作用 ?
+    // 把INCRBYFLOAT 命令改成 SET 命令，后面在执行AOF时写入的时 SET 命令?
+    // 目的是什么. 避免同步或replica的不一致？
     aux = createStringObject("SET",3);
     rewriteClientCommandArgument(c,0,aux);
     decrRefCount(aux);
     rewriteClientCommandArgument(c,2,new);
 }
 
+// APPEND key value
+// 如果 key 已经存在并且是一个字符串， APPEND 命令将 value 追加到 key 原来的值的末尾
 void appendCommand(client *c) {
     size_t totlen;
     robj *o, *append;
@@ -480,6 +515,8 @@ void appendCommand(client *c) {
     addReplyLongLong(c,totlen);
 }
 
+// STRLEN key
+// 返回 key 所储存的字符串值的长度
 void strlenCommand(client *c) {
     robj *o;
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||

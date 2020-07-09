@@ -120,7 +120,7 @@ robj *createStringObjectFromLongDouble(long double value, int humanfriendly) {
     char buf[256];
     int len;
 
-    if (isinf(value)) {
+    if (isinf(value)) { //std api
         /* Libc in odd systems (Hi Solaris!) will format infinite in a
          * different way, so better to handle it in an explicit way. */
         if (value > 0) {
@@ -527,9 +527,11 @@ int equalStringObjects(robj *a, robj *b) {
 
 size_t stringObjectLen(robj *o) {
     serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+    // sdsEncodedObject(objptr) --> (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
     if (sdsEncodedObject(o)) {
         return sdslen(o->ptr);
     } else {
+        // 不是字符串, 算出整数 字符串形式的长度
         return sdigits10((long)o->ptr);
     }
 }
@@ -584,13 +586,15 @@ int getLongDoubleFromObject(robj *o, long double *target) {
         value = 0;
     } else {
         serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+        // sdsEncodedObject(objptr) ==> (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
         if (sdsEncodedObject(o)) {
             errno = 0;
-            value = strtold(o->ptr, &eptr);
+            value = strtold(o->ptr, &eptr); //std api
             if (isspace(((char*)o->ptr)[0]) || eptr[0] != '\0' ||
                 errno == ERANGE || isnan(value))
                 return C_ERR;
         } else if (o->encoding == OBJ_ENCODING_INT) {
+            // 原来是整数可以直接使用
             value = (long)o->ptr;
         } else {
             serverPanic("Unknown string encoding");
@@ -602,6 +606,7 @@ int getLongDoubleFromObject(robj *o, long double *target) {
 
 int getLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, const char *msg) {
     long double value;
+    // 从int 或是 string 获取一个float
     if (getLongDoubleFromObject(o, &value) != C_OK) {
         if (msg != NULL) {
             addReplyError(c,(char*)msg);
