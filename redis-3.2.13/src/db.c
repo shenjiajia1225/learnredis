@@ -128,6 +128,7 @@ robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
 
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
  * common case. */
+// 和 lookupKeyWrite 区别：1.会统计访问是否成功 2.如果是在slave上访问key，虽然过期了但是可能还是会返回数据
 robj *lookupKeyRead(redisDb *db, robj *key) {
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
 }

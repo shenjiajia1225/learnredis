@@ -1340,6 +1340,7 @@ int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
     if (sval)
         *sval = -123456789;
 
+    // 找到quick node, node->zl 就是一个ziplist
     quicklistNode *node;
     if (where == QUICKLIST_HEAD && quicklist->head) {
         node = quicklist->head;
@@ -1349,7 +1350,9 @@ int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
         return 0;
     }
 
+    // 从ziplist中根据 where 获取到对应得 zlentry , 即p
     p = ziplistIndex(node->zl, pos);
+    // 从zlentry中取得值
     if (ziplistGet(p, &vstr, &vlen, &vlong)) {
         if (vstr) {
             if (data)

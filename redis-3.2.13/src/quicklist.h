@@ -44,8 +44,10 @@
 typedef struct quicklistNode {
     struct quicklistNode *prev;
     struct quicklistNode *next;
+    // 每个节点都会指向一个ziplist 或是 一个 quicklistLZF
     unsigned char *zl;
     unsigned int sz;             /* ziplist size in bytes */
+    // ziplist中元素个数
     unsigned int count : 16;     /* count of items in ziplist */
     unsigned int encoding : 2;   /* RAW==1 or LZF==2 */
     unsigned int container : 2;  /* NONE==1 or ZIPLIST==2 */
@@ -73,7 +75,9 @@ typedef struct quicklistLZF {
 typedef struct quicklist {
     quicklistNode *head;
     quicklistNode *tail;
+    // 列表中得元素总数
     unsigned long count;        /* total count of all entries in all ziplists */
+    // node得个数
     unsigned int len;           /* number of quicklistNodes */
     int fill : 16;              /* fill factor for individual nodes */
     unsigned int compress : 16; /* depth of end nodes not to compress;0=off */

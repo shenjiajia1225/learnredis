@@ -54,6 +54,7 @@ void *listPopSaver(unsigned char *data, unsigned int sz) {
     return createStringObject((char*)data,sz);
 }
 
+// subject是一个quicklist
 robj *listTypePop(robj *subject, int where) {
     long long vlong;
     robj *value = NULL;
@@ -71,8 +72,9 @@ robj *listTypePop(robj *subject, int where) {
     return value;
 }
 
+// subject是一个quicklist
 unsigned long listTypeLength(robj *subject) {
-    if (subject->encoding == OBJ_ENCODING_QUICKLIST) {
+    if (subject->encoding == OBJ_ENCODING_QUICKLIST) { // 只支持这个类型
         return quicklistCount(subject->ptr);
     } else {
         serverPanic("Unknown list encoding");
@@ -877,24 +879,27 @@ void blockingPopGenericCommand(client *c, int where) {
     mstime_t timeout;
     int j;
 
+    // 获取timeout参数 只能是秒为单位
     if (getTimeoutFromObjectOrReply(c,c->argv[c->argc-1],&timeout,UNIT_SECONDS)
         != C_OK) return;
 
     for (j = 1; j < c->argc-1; j++) {
         o = lookupKeyWrite(c->db,c->argv[j]);
         if (o != NULL) {
-            if (o->type != OBJ_LIST) {
+            if (o->type != OBJ_LIST) { // key对应得value不是list
                 addReply(c,shared.wrongtypeerr);
                 return;
             } else {
                 if (listTypeLength(o) != 0) {
+                    // 找到一个有数据得list，可以返回数据，不会阻塞
+                    // 所有得list都是 quicklist 类型
                     /* Non empty list, this is like a non normal [LR]POP. */
                     char *event = (where == LIST_HEAD) ? "lpop" : "rpop";
                     robj *value = listTypePop(o,where);
                     serverAssert(value != NULL);
 
                     addReplyMultiBulkLen(c,2);
-                    addReplyBulk(c,c->argv[j]);
+                    addReplyBulk(c,c->argv[j]); // 一同返回key内容
                     addReplyBulk(c,value);
                     decrRefCount(value);
                     notifyKeyspaceEvent(NOTIFY_LIST,event,
@@ -907,6 +912,7 @@ void blockingPopGenericCommand(client *c, int where) {
                     signalModifiedKey(c->db,c->argv[j]);
                     server.dirty++;
 
+                    // 修改记录到aof文件内得命令
                     /* Replicate it as an [LR]POP instead of B[LR]POP. */
                     rewriteClientCommandVector(c,2,
                         (where == LIST_HEAD) ? shared.lpop : shared.rpop,
@@ -924,18 +930,30 @@ void blockingPopGenericCommand(client *c, int where) {
         return;
     }
 
+    // 找不到数据会被阻塞
     /* If the list is empty or the key does not exists we must block */
     blockForKeys(c, c->argv + 1, c->argc - 2, timeout, NULL);
 }
 
+// BLPOP key [key ...] timeout
+// BLPOP 是列表的阻塞式(blocking)弹出原语。
+// 它是 LPOP 命令的阻塞版本，当给定列表内没有任何元素可供弹出的时候，连接将被 BLPOP 命令阻塞，直到等待超时或发现可弹出元素为止。
+// 当给定多个 key 参数时，按参数 key 的先后顺序依次检查各个列表，弹出第一个非空列表的头元素。
 void blpopCommand(client *c) {
     blockingPopGenericCommand(c,LIST_HEAD);
 }
 
+// BRPOP key [key ...] timeout
+// BRPOP 是列表的阻塞式(blocking)弹出原语。
+// 它是 RPOP 命令的阻塞版本，当给定列表内没有任何元素可供弹出的时候，连接将被 BRPOP 命令阻塞，直到等待超时或发现可弹出元素为止。
+// 当给定多个 key 参数时，按参数 key 的先后顺序依次检查各个列表，弹出第一个非空列表的尾部元素。
 void brpopCommand(client *c) {
     blockingPopGenericCommand(c,LIST_TAIL);
 }
 
+// BRPOPLPUSH source destination timeout
+// BRPOPLPUSH 是 RPOPLPUSH 的阻塞版本，当给定列表 source 不为空时， BRPOPLPUSH 的表现和 RPOPLPUSH 一样。
+// 当列表 source 为空时， BRPOPLPUSH 命令将阻塞连接，直到等待超时，或有另一个客户端对 source 执行 LPUSH 或 RPUSH 命令为止。
 void brpoplpushCommand(client *c) {
     mstime_t timeout;
 
