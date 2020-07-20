@@ -192,7 +192,7 @@ int _dictInit(dict *d, dictType *type,
 int dictResize(dict *d)
 {
     int minimal;
-
+    // #define dictIsRehashing(d) ((d)->rehashidx != -1)
     if (!dict_can_resize || dictIsRehashing(d)) return DICT_ERR;
     minimal = d->ht[0].used;
     if (minimal < DICT_HT_INITIAL_SIZE)
@@ -232,7 +232,7 @@ int dictExpand(dict *d, unsigned long size)
     /* Prepare a second hash table for incremental rehashing */
     // 否则扩容 准备rehash
     d->ht[1] = n;
-    d->rehashidx = 0;
+    d->rehashidx = 0; // 指向下一个即将要重新rehash的索引
     return DICT_OK;
 }
 
@@ -246,6 +246,7 @@ int dictExpand(dict *d, unsigned long size)
  * will visit at max N*10 empty buckets in total, otherwise the amount of
  * work it does would be unbound and the function may block for a long time. */
 int dictRehash(dict *d, int n) {
+    // 函数在定时器内被调用，或是在操作hash表时也会执行部分rehash
     // 将ht[0]（较小容量）的数据rehash到ht[1] (较大容量)， 所有完成后 重新挪到ht[0]
     // 在给dict扩容时需要使用，容量变了后hash_index也变了
     // n 和empty_visits用于控制本地操作的步骤长度 防止一个很大的dict在rehash时占用太多时间
@@ -258,12 +259,15 @@ int dictRehash(dict *d, int n) {
 
         /* Note that rehashidx can't overflow as we are sure there are more
          * elements because ht[0].used != 0 */
+        // 找到第一个有数据的下标项
         assert(d->ht[0].size > (unsigned long)d->rehashidx);
         while(d->ht[0].table[d->rehashidx] == NULL) {
             d->rehashidx++;
             if (--empty_visits == 0) return 1;
         }
         de = d->ht[0].table[d->rehashidx];
+        // de 相当于是ht[0].table[xxx]的一个链表头节点
+        // 下面的while取此链表里的每个节点，链接到新的ht[1].table[???]中, 始终插入到头部
         /* Move all the keys in this bucket from the old to the new hash HT */
         while(de) {
             unsigned int h;
@@ -303,6 +307,7 @@ long long timeInMilliseconds(void) {
 
 /* Rehash for an amount of time between ms milliseconds and ms+1 milliseconds */
 int dictRehashMilliseconds(dict *d, int ms) {
+    // rehash的时间不能太长，ms是一个limit限制
     long long start = timeInMilliseconds();
     int rehashes = 0;
 
@@ -322,6 +327,7 @@ int dictRehashMilliseconds(dict *d, int ms) {
  * dictionary so that the hash table automatically migrates from H1 to H2
  * while it is actively used. */
 static void _dictRehashStep(dict *d) {
+    // 如果没有safe的迭代器在遍历dict的话，可以进行rehash
     if (d->iterators == 0) dictRehash(d,1);
 }
 
@@ -371,6 +377,7 @@ dictEntry *dictAddRaw(dict *d, void *key)
      * system it is more likely that recently added entries are accessed
      * more frequently. */
     // 将key加入到正确的ht表中
+    // 插入到表头
     ht = dictIsRehashing(d) ? &d->ht[1] : &d->ht[0];
     entry = zmalloc(sizeof(*entry));
     entry->next = ht->table[index];
@@ -393,6 +400,7 @@ int dictReplace(dict *d, void *key, void *val)
 
     /* Try to add the element. If the key
      * does not exists dictAdd will suceed. */
+    // 先尝试新增
     if (dictAdd(d, key, val) == DICT_OK)
         return 1;
     /* It already exists, get the entry */
@@ -542,6 +550,7 @@ void *dictFetchValue(dict *d, const void *key) {
  * the fingerprint again when the iterator is released.
  * If the two fingerprints are different it means that the user of the iterator
  * performed forbidden operations against the dictionary while iterating. */
+// hash的一个指纹，用于判断当前dict有没有发生变化
 long long dictFingerprint(dict *d) {
     long long integers[6], hash = 0;
     int j;
@@ -580,7 +589,7 @@ dictIterator *dictGetIterator(dict *d)
 
     iter->d = d;
     iter->table = 0;
-    iter->index = -1;
+    iter->index = -1; // 遍历用的槽位索引
     iter->safe = 0;
     iter->entry = NULL;
     iter->nextEntry = NULL;
@@ -604,14 +613,16 @@ dictEntry *dictNext(dictIterator *iter)
     // dictRehashMilliseconds 接口会被时钟调用到
     while (1) {
         if (iter->entry == NULL) {
+            // 第一次调用next, 或是遍历到了一个链表的尾部
             dictht *ht = &iter->d->ht[iter->table];
             if (iter->index == -1 && iter->table == 0) {
+                // 首次调用
                 if (iter->safe)
-                    iter->d->iterators++;
+                    iter->d->iterators++; // 使用safe迭代器时 要增加当前正在使用中的迭代器个数
                 else
-                    iter->fingerprint = dictFingerprint(iter->d);
+                    iter->fingerprint = dictFingerprint(iter->d); // 非safe型 获取指纹
             }
-            iter->index++;
+            iter->index++; // 遍历的槽数量
             if (iter->index >= (long) ht->size) {
                 if (dictIsRehashing(iter->d) && iter->table == 0) {
                     iter->table++;
@@ -657,6 +668,7 @@ dictEntry *dictGetRandomKey(dict *d)
 
     if (dictSize(d) == 0) return NULL;
     if (dictIsRehashing(d)) _dictRehashStep(d);
+    // 先随机到某一个槽位
     if (dictIsRehashing(d)) {
         do {
             /* We are sure there are no elements in indexes from 0
@@ -678,6 +690,7 @@ dictEntry *dictGetRandomKey(dict *d)
      * list and we need to get a random element from the list.
      * The only sane way to do so is counting the elements and
      * select a random index. */
+    // 在次槽位中在随机一个值
     listlen = 0;
     orighe = he;
     while(he) {
@@ -894,6 +907,7 @@ unsigned long dictScan(dict *d,
 
     if (dictSize(d) == 0) return 0;
 
+    // 访问 table[v]的槽位数据
     // dictht.sizemask 是一个二进制全为1的数字(在分配表空间时保证了size时2的次方)
     if (!dictIsRehashing(d)) {
         t0 = &(d->ht[0]);
@@ -920,6 +934,11 @@ unsigned long dictScan(dict *d,
         t1 = &d->ht[1];
 
         /* Make sure t0 is the smaller and t1 is the bigger table */
+        // 无论是扩容还是缩容，两个ht的size都不一样
+        // 从位数少的一放 遍历到位数多的一方，是为了保证不会遗漏数据（但是可能会有数据重复）
+        // 例如 110   -->  0110 1110
+        // 即t0要遍历 110 , t1要遍历 0110 1110
+        // 会有重复元素 但是不会遗漏
         if (t0->size > t1->size) {
             t0 = &d->ht[1];
             t1 = &d->ht[0];
@@ -1019,6 +1038,7 @@ static int _dictKeyIndex(dict *d, const void *key)
     for (table = 0; table <= 1; table++) {
         idx = h & d->ht[table].sizemask;
         /* Search if this slot does not already contain the given key */
+        // 在此链表里遍历查找是否存在一样的key
         he = d->ht[table].table[idx];
         while(he) {
             if (key==he->key || dictCompareKeys(d, key, he->key))
