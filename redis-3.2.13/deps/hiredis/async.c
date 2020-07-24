@@ -114,6 +114,7 @@ static redisAsyncContext *redisAsyncInitialize(redisContext *c) {
     /* The regular connect functions will always set the flag REDIS_CONNECTED.
      * For the async API, we want to wait until the first write event is
      * received up before setting this flag, so reset it here. */
+    // 把第二个比特位也清0
     c->flags &= ~REDIS_CONNECTED;
 
     ac->err = 0;
@@ -167,6 +168,7 @@ redisAsyncContext *redisAsyncConnect(const char *ip, int port) {
 
 redisAsyncContext *redisAsyncConnectBind(const char *ip, int port,
                                          const char *source_addr) {
+    // 同步连接完成后 c->flags 最后一个比特位是0
     redisContext *c = redisConnectBindNonBlock(ip,port,source_addr);
     redisAsyncContext *ac = redisAsyncInitialize(c);
     __redisAsyncCopyError(ac);
@@ -526,6 +528,9 @@ void redisAsyncHandleWrite(redisAsyncContext *ac) {
     redisContext *c = &(ac->c);
     int done = 0;
 
+    // sentinel事件主循环首次调用到这里时 c->flags == 0
+    // 因此会触发执行 __redisAsyncHandleConnect 函数
+    // 也即调用设置的onConnect回调函数
     if (!(c->flags & REDIS_CONNECTED)) {
         /* Abort connect was not successful. */
         if (__redisAsyncHandleConnect(ac) != REDIS_OK)
@@ -545,6 +550,7 @@ void redisAsyncHandleWrite(redisAsyncContext *ac) {
             _EL_DEL_WRITE(ac);
 
         /* Always schedule reads after writes */
+        // 发送完数据设置可read
         _EL_ADD_READ(ac);
     }
 }
@@ -616,6 +622,8 @@ static int __redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void 
          c->flags |= REDIS_MONITORING;
          __redisPushCallback(&ac->replies,&cb);
     } else {
+        // 当sentinel首次连完master，准备发送AUTH时，c->flags == 0
+        // 将cb加入到callback队列里
         if (c->flags & REDIS_SUBSCRIBED)
             /* This will likely result in an error reply, but it needs to be
              * received and passed to the callback. */
@@ -624,9 +632,11 @@ static int __redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void 
             __redisPushCallback(&ac->replies,&cb);
     }
 
+    // 命令写入context的缓冲区
     __redisAppendCommand(c,cmd,len);
 
     /* Always schedule a write when the write buffer is non-empty */
+    // 加入到eventloop中
     _EL_ADD_WRITE(ac);
 
     return REDIS_OK;

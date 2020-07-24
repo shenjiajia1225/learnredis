@@ -989,6 +989,7 @@ void __redisSetError(redisContext *c, int type, const char *str) {
 static redisContext *redisContextInit(void) {
     redisContext *c;
 
+    // calloc 会将分配内存清0
     c = calloc(1,sizeof(redisContext));
     if (c == NULL)
         return NULL;
@@ -1059,7 +1060,7 @@ redisContext *redisConnectNonBlock(const char *ip, int port) {
 redisContext *redisConnectBindNonBlock(const char *ip, int port,
                                        const char *source_addr) {
     redisContext *c = redisContextInit();
-    c->flags &= ~REDIS_BLOCK;
+    c->flags &= ~REDIS_BLOCK; // 最后一个bit位设置0
     redisContextConnectBindTcp(c,ip,port,NULL,source_addr);
     return c;
 }

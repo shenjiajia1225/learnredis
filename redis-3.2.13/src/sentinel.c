@@ -344,7 +344,8 @@ static int redisAeAttach(aeEventLoop *loop, redisAsyncContext *ac) {
     e->reading = e->writing = 0;
 
     /* Register functions to start/stop listening for events */
-    ac->ev.addRead = redisAeAddRead;
+    // 设置事件回调函数，具体回调接口在hiredis中
+    ac->ev.addRead = redisAeAddRead; // redisAsyncHandleRead
     ac->ev.delRead = redisAeDelRead;
     ac->ev.addWrite = redisAeAddWrite;
     ac->ev.delWrite = redisAeDelWrite;
@@ -451,6 +452,7 @@ void initSentinel(void) {
 
     /* Remove usual Redis commands from the command table, then just add
      * the SENTINEL command. */
+    // 设置sentinel支持得命令
     dictEmpty(server.commands,NULL);
     for (j = 0; j < sizeof(sentinelcmds)/sizeof(sentinelcmds[0]); j++) {
         int retval;
@@ -1147,7 +1149,8 @@ void sentinelDisconnectCallback(const redisAsyncContext *c, int status) {
  * with the same ID already exists. */
 
 sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *hostname, int port, int quorum, sentinelRedisInstance *master) {
-    sentinelRedisInstance *ri;
+    // 初始化monitor master时使用得参数 name=argv[1] flags=SRI_MASTER hostname=argv[2] ip=argv[3] master=NULL
+    sentinelRedisInstane *ri;
     sentinelAddr *addr;
     dict *table = NULL;
     char slavename[NET_PEER_ID_LEN], *sdsname;
@@ -1864,10 +1867,13 @@ void sentinelFlushConfig(void) {
     int rewrite_status;
 
     server.hz = CONFIG_DEFAULT_HZ;
+    // 这里是真正得刷新配置 写入文件
+    // 注意该调用没有将数据同步写回文件(文件内容可能在缓冲区中)
     rewrite_status = rewriteConfig(server.configfile);
     server.hz = saved_hz;
 
     if (rewrite_status == -1) goto werr;
+    // 尝试打开配置文件，并调用fsync刷新回磁盘
     if ((fd = open(server.configfile,O_RDONLY)) == -1) goto werr;
     if (fsync(fd) == -1) goto werr;
     if (close(fd) == EOF) goto werr;
@@ -1891,6 +1897,11 @@ void sentinelSendAuthIfNeeded(sentinelRedisInstance *ri, redisAsyncContext *c) {
                                                  ri->master->auth_pass;
 
     if (auth_pass) {
+        // 首次调用redisAsyncCommand会将context真正加入到eventloop中,此时会触发有writeable事件
+        // 在hiredis中的 _EL_ADD_WRITE ，会调用到 redisAeAddWrite
+        // 此时会设置writeable的回调: redisAeWriteEvent. eventloop事件循环会调用
+        // 注意这里命令都会设置一个回调函数，该函数被设置在replies中，会在read事件后被调用到
+        // 即sentinel发送命令，redisAsyncHandleRead中收到并处理reply，调用回调
         if (redisAsyncCommand(c, sentinelDiscardReplyCallback, ri, "AUTH %s",
             auth_pass) == C_OK) ri->link->pending_commands++;
     }
@@ -1917,16 +1928,20 @@ void sentinelSetClientName(sentinelRedisInstance *ri, redisAsyncContext *c, char
  * is disconnected. Note that link->disconnected is true even if just
  * one of the two links (commands and pub/sub) is missing. */
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
-    if (ri->link->disconnected == 0) return;
+    if (ri->link->disconnected == 0) return; // 已连接不处理
     if (ri->addr->port == 0) return; /* port == 0 means invalid address. */
+    // link里面有两个连接对象
     instanceLink *link = ri->link;
     mstime_t now = mstime();
 
+    // 重连不能太频繁
     if (now - ri->link->last_reconn_time < SENTINEL_PING_PERIOD) return;
     ri->link->last_reconn_time = now;
 
     /* Commands connection. */
     if (link->cc == NULL) {
+        // 是一个同步连接调用, 注意连接完成后，flags的最后2个比特位设置位0
+        // 第0个比特位是 REDIS_BLOCK, 第1个比特位是 REDIS_CONNECTED
         link->cc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
         if (link->cc->err) {
             sentinelEvent(LL_DEBUG,"-cmd-link-reconnection",ri,"%@ #%s",
@@ -1936,11 +1951,15 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             link->pending_commands = 0;
             link->cc_conn_time = mstime();
             link->cc->data = link;
+            // 连接成功后设置事件管理对象 注意还没有将连接加入到server事件eventloop里
             redisAeAttach(server.el,link->cc);
+            // 设置回调 onConnect onDisconnect
             redisAsyncSetConnectCallback(link->cc,
                     sentinelLinkEstablishedCallback);
             redisAsyncSetDisconnectCallback(link->cc,
                     sentinelDisconnectCallback);
+            // 下面两个调用会触发添加write事件, 事件主循环writeable会先调用onConnect函数
+            // 然后在发送数据. 见hiredis 的 redisAsyncHandleWrite
             sentinelSendAuthIfNeeded(ri,link->cc);
             sentinelSetClientName(ri,link->cc,"cmd");
 
@@ -4262,6 +4281,7 @@ void sentinelAbortFailover(sentinelRedisInstance *ri) {
 void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     /* ========== MONITORING HALF ============ */
     /* Every kind of instance */
+    // 没有连接是先尝试连接redis实例
     sentinelReconnectInstance(ri);
     sentinelSendPeriodicCommands(ri);
 
@@ -4304,8 +4324,9 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
     di = dictGetIterator(instances);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
-
+        // 对每个监控得redis实例处理. 首次被调用时 instances 是未连接完成得master配置数据
         sentinelHandleRedisInstance(ri);
+        // 如果是连了master，还要连slave和其他sentinel
         if (ri->flags & SRI_MASTER) {
             sentinelHandleDictOfRedisInstances(ri->slaves);
             sentinelHandleDictOfRedisInstances(ri->sentinels);
@@ -4350,8 +4371,10 @@ void sentinelCheckTiltCondition(void) {
     sentinel.previous_time = mstime();
 }
 
+// serverCron 时钟里面调用sentinel得定时函数
 void sentinelTimer(void) {
     sentinelCheckTiltCondition();
+    // 主动连接master. masters 得数据在 createSentinelRedisInstance 中创建(读取配置时被调用)
     sentinelHandleDictOfRedisInstances(sentinel.masters);
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
