@@ -424,6 +424,7 @@ void redisProcessCallbacks(redisAsyncContext *ac) {
             break;
         }
 
+        // 收到一个replay了，取出一个callback，回调
         /* Even if the context is subscribed, pending regular callbacks will
          * get a reply before pub/sub messages arrive. */
         if (__redisShiftCallback(&ac->replies,&cb) != REDIS_OK) {
@@ -506,6 +507,7 @@ static int __redisAsyncHandleConnect(redisAsyncContext *ac) {
 void redisAsyncHandleRead(redisAsyncContext *ac) {
     redisContext *c = &(ac->c);
 
+    // read事件回调
     if (!(c->flags & REDIS_CONNECTED)) {
         /* Abort connect was not successful. */
         if (__redisAsyncHandleConnect(ac) != REDIS_OK)
@@ -551,6 +553,7 @@ void redisAsyncHandleWrite(redisAsyncContext *ac) {
 
         /* Always schedule reads after writes */
         // 发送完数据设置可read
+        // 当主循环触发read事件后，会调用 redisAsyncHandleRead 函数
         _EL_ADD_READ(ac);
     }
 }
@@ -636,7 +639,8 @@ static int __redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void 
     __redisAppendCommand(c,cmd,len);
 
     /* Always schedule a write when the write buffer is non-empty */
-    // 加入到eventloop中
+    // 加入到eventloop中 write事件
+    // 当主循环触发write事件后 会调用 redisAsyncHandleWrite 函数
     _EL_ADD_WRITE(ac);
 
     return REDIS_OK;

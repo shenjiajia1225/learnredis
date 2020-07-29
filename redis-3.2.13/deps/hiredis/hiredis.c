@@ -1152,6 +1152,7 @@ int redisBufferRead(redisContext *c) {
         __redisSetError(c,REDIS_ERR_EOF,"Server closed the connection");
         return REDIS_ERR;
     } else {
+        // 这里只是将数据拷到了缓冲区 没有解析
         if (redisReaderFeed(c->reader,buf,nread) != REDIS_OK) {
             __redisSetError(c,c->reader->err,c->reader->errstr);
             return REDIS_ERR;
@@ -1212,6 +1213,8 @@ int redisGetReply(redisContext *c, void **reply) {
     int wdone = 0;
     void *aux = NULL;
 
+    // 获取一个replay, 发出一个cmd，收到的数据即是replay
+
     /* Try to read pending replies */
     if (redisGetReplyFromReader(c,&aux) == REDIS_ERR)
         return REDIS_ERR;
@@ -1226,8 +1229,10 @@ int redisGetReply(redisContext *c, void **reply) {
 
         /* Read until there is a reply */
         do {
+            // 继续读数据
             if (redisBufferRead(c) == REDIS_ERR)
                 return REDIS_ERR;
+            // 直到能解出一个replay完整包
             if (redisGetReplyFromReader(c,&aux) == REDIS_ERR)
                 return REDIS_ERR;
         } while (aux == NULL);

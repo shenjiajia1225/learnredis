@@ -1150,6 +1150,11 @@ void sentinelDisconnectCallback(const redisAsyncContext *c, int status) {
 
 sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *hostname, int port, int quorum, sentinelRedisInstance *master) {
     // 初始化monitor master时使用得参数 name=argv[1] flags=SRI_MASTER hostname=argv[2] ip=argv[3] master=NULL
+    // 一组sentinel可以监控多组redis，即多个master, 多个master使用 name 作为key区分
+    // 一组redis包含一个master和多个slave
+    // sentinel.masters 是所有master的map
+    // 当参数master==NULL时表示当前要增加一个master，否则就是给指定的master添加slave和sentinel
+    // sentinel 不是公共使用的吗？？
     sentinelRedisInstane *ri;
     sentinelAddr *addr;
     dict *table = NULL;
@@ -1916,6 +1921,8 @@ void sentinelSendAuthIfNeeded(sentinelRedisInstance *ri, redisAsyncContext *c) {
 void sentinelSetClientName(sentinelRedisInstance *ri, redisAsyncContext *c, char *type) {
     char name[64];
 
+    // 对应redis会调用 clientCommand 
+    // setname给redis那边得对应连接设置好名称
     snprintf(name,sizeof(name),"sentinel-%.8s-%s",sentinel.myid,type);
     if (redisAsyncCommand(c, sentinelDiscardReplyCallback, ri,
         "CLIENT SETNAME %s", name) == C_OK)
@@ -1930,7 +1937,7 @@ void sentinelSetClientName(sentinelRedisInstance *ri, redisAsyncContext *c, char
 void sentinelReconnectInstance(sentinelRedisInstance *ri) {
     if (ri->link->disconnected == 0) return; // 已连接不处理
     if (ri->addr->port == 0) return; /* port == 0 means invalid address. */
-    // link里面有两个连接对象
+    // link里面有两个连接对象 cc=Commands connection   pc=Pub / Sub 
     instanceLink *link = ri->link;
     mstime_t now = mstime();
 
@@ -1961,7 +1968,7 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             // 下面两个调用会触发添加write事件, 事件主循环writeable会先调用onConnect函数
             // 然后在发送数据. 见hiredis 的 redisAsyncHandleWrite
             sentinelSendAuthIfNeeded(ri,link->cc);
-            sentinelSetClientName(ri,link->cc,"cmd");
+            sentinelSetClientName(ri,link->cc,"cmd"); // 通知redis设置此连接的name
 
             /* Send a PING ASAP when reconnecting. */
             sentinelSendPing(ri);
@@ -1969,6 +1976,7 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
     }
     /* Pub / Sub */
     if ((ri->flags & (SRI_MASTER|SRI_SLAVE)) && link->pc == NULL) {
+        // 建立另外一个连接
         link->pc = redisAsyncConnectBind(ri->addr->ip,ri->addr->port,NET_FIRST_BIND_ADDR);
         if (link->pc->err) {
             sentinelEvent(LL_DEBUG,"-pubsub-link-reconnection",ri,"%@ #%s",
@@ -1985,8 +1993,10 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             redisAsyncSetDisconnectCallback(link->pc,
                     sentinelDisconnectCallback);
             sentinelSendAuthIfNeeded(ri,link->pc);
-            sentinelSetClientName(ri,link->pc,"pubsub");
+            sentinelSetClientName(ri,link->pc,"pubsub"); // 通知redis设置此连接的name
             /* Now we subscribe to the Sentinels "Hello" channel. */
+            // redisAsyncCommand 发送命令，收到回复后调用对应的回调函数
+            // sentinel向redis发送sub命令
             retval = redisAsyncCommand(link->pc,
                 sentinelReceiveHelloMessages, ri, "SUBSCRIBE %s",
                     SENTINEL_HELLO_CHANNEL);
@@ -4374,7 +4384,7 @@ void sentinelCheckTiltCondition(void) {
 // serverCron 时钟里面调用sentinel得定时函数
 void sentinelTimer(void) {
     sentinelCheckTiltCondition();
-    // 主动连接master. masters 得数据在 createSentinelRedisInstance 中创建(读取配置时被调用)
+    // 主动连接master. masters 的数据在 createSentinelRedisInstance 中创建(读取配置时被调用)
     sentinelHandleDictOfRedisInstances(sentinel.masters);
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
