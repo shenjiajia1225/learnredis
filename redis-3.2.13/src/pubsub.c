@@ -60,11 +60,15 @@ int pubsubSubscribeChannel(client *c, robj *channel) {
     list *clients = NULL;
     int retval = 0;
 
+    // c->pubsub_channels 记录订阅得频道, 只是一个是否存在得标记
+    // server.pubsub_channels 记录得是订阅得频道得所有clients
+    // 都是dict
     /* Add the channel to the client -> channels hash table */
     if (dictAdd(c->pubsub_channels,channel,NULL) == DICT_OK) {
         retval = 1;
         incrRefCount(channel);
         /* Add the client to the channel -> list of clients hash table */
+        // 不同客户端订阅同一个channel时，只需要增加此channel上得client即可
         de = dictFind(server.pubsub_channels,channel);
         if (de == NULL) {
             clients = listCreate();
@@ -91,6 +95,7 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
     listNode *ln;
     int retval = 0;
 
+    // 取消订阅，从当前连接删除对应频道, 从server得频道列表删除对应client
     /* Remove the channel from the client -> channels hash table */
     incrRefCount(channel); /* channel may be just a pointer to the same object
                             we have in the hash tables. Protect it... */
@@ -127,11 +132,16 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
 int pubsubSubscribePattern(client *c, robj *pattern) {
     int retval = 0;
 
+    // 按模式订阅
+    // 两个都使用list
+    // 模式订阅时，当发布一个msg时，除了在dict中查找名称一样得channel外，
+    // 还需要对所有模式channel去匹配是否符合，因此这里使用list，即需要完整遍历一遍pattern得channel list
     if (listSearchKey(c->pubsub_patterns,pattern) == NULL) {
         retval = 1;
         pubsubPattern *pat;
         listAddNodeTail(c->pubsub_patterns,pattern);
         incrRefCount(pattern);
+        // 不同客户端订阅同一个模式时 是一个单独模式对象了
         pat = zmalloc(sizeof(*pat));
         pat->pattern = getDecodedObject(pattern);
         pat->client = c;
@@ -229,12 +239,14 @@ int pubsubPublishMessage(robj *channel, robj *message) {
     listIter li;
 
     /* Send to clients listening for that channel */
+    // 对指定频道发送
     de = dictFind(server.pubsub_channels,channel);
     if (de) {
         list *list = dictGetVal(de);
         listNode *ln;
         listIter li;
 
+        // 所有订阅该channel得clients
         listRewind(list,&li);
         while ((ln = listNext(&li)) != NULL) {
             client *c = ln->value;
@@ -248,6 +260,7 @@ int pubsubPublishMessage(robj *channel, robj *message) {
     }
     /* Send to clients listening to matching channels */
     if (listLength(server.pubsub_patterns)) {
+        // 对模式list 遍历，匹配发送
         listRewind(server.pubsub_patterns,&li);
         channel = getDecodedObject(channel);
         while ((ln = listNext(&li)) != NULL) {
