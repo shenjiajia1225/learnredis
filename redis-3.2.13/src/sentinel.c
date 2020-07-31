@@ -42,6 +42,11 @@ extern char **environ;
 
 #define REDIS_SENTINEL_PORT 26379
 
+
+/*
+ * 1. 先关注没有异常情况下 多个sentinel 监控多个master和slave得情形，包括链接得建立管理等
+ */
+
 /* ======================== Sentinel global state =========================== */
 
 /* Address object, used to describe an ip:port pair. */
@@ -587,6 +592,7 @@ int sentinelAddrIsEqual(sentinelAddr *a, sentinelAddr *b) {
  */
 void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
                    const char *fmt, ...) {
+    // 写log， 给 type channel publish 一个消息
     va_list ap;
     char msg[LOG_MAX_LEN];
     robj *channel, *payload;
@@ -1029,6 +1035,7 @@ int sentinelTryConnectionSharing(sentinelRedisInstance *ri) {
     if (ri->runid == NULL) return C_ERR; /* No way to identify it. */
     if (ri->link->refcount > 1) return C_ERR; /* Already shared. */
 
+    // 从其他master得 sentinels中查找是否已经存在一个link链接了
     di = dictGetIterator(sentinel.masters);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *master = dictGetVal(de), *match;
@@ -1042,6 +1049,7 @@ int sentinelTryConnectionSharing(sentinelRedisInstance *ri) {
 
         /* We identified a matching Sentinel, great! Let's free our link
          * and use the one of the matching Sentinel. */
+        // 释放掉ri得link, link也是一个对象，用来管理 cc 和 pc 两个链接
         releaseInstanceLink(ri->link,NULL);
         ri->link = match->link;
         match->link->refcount++;
@@ -1278,6 +1286,7 @@ void releaseSentinelRedisInstance(sentinelRedisInstance *ri) {
 sentinelRedisInstance *sentinelRedisInstanceLookupSlave(
                 sentinelRedisInstance *ri, char *ip, int port)
 {
+    // slave 使用ip和端口来作为key
     sds key;
     sentinelRedisInstance *slave;
     char buf[NET_PEER_ID_LEN];
@@ -1996,7 +2005,8 @@ void sentinelReconnectInstance(sentinelRedisInstance *ri) {
             sentinelSetClientName(ri,link->pc,"pubsub"); // 通知redis设置此连接的name
             /* Now we subscribe to the Sentinels "Hello" channel. */
             // redisAsyncCommand 发送命令，收到回复后调用对应的回调函数
-            // sentinel向redis发送sub命令
+            // sentinel向redis发送sub命令 ，订阅 SENTINEL_HELLO_CHANNEL 频道内容
+            // 当又其他sentinel向此channel发送数据库，会触发调用 sentinelReceiveHelloMessages 函数
             retval = redisAsyncCommand(link->pc,
                 sentinelReceiveHelloMessages, ri, "SUBSCRIBE %s",
                     SENTINEL_HELLO_CHANNEL);
@@ -2031,6 +2041,7 @@ int sentinelMasterLooksSane(sentinelRedisInstance *master) {
 
 /* Process the INFO output from masters. */
 void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
+    // 来自redis得info数据
     sds *lines;
     int numlines, j;
     int role = 0;
@@ -2044,6 +2055,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
     ri->master_link_down_time = 0;
 
     /* Process line by line. */
+    // INFO 命令返回值是一行一条信息
     lines = sdssplitlen(info,strlen(info),"\r\n",2,&numlines);
     for (j = 0; j < numlines; j++) {
         sentinelRedisInstance *slave;
@@ -2068,6 +2080,8 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
             sdslen(l) >= 7 &&
             !memcmp(l,"slave",5) && isdigit(l[5]))
         {
+            // 如果当前得链接ri是一个master得，则info数据来自master
+            // 里面回包含slave得数据
             char *ip, *port, *end;
 
             if (strstr(l,"ip=") == NULL) {
@@ -2092,6 +2106,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
 
             /* Check if we already have this slave into our table,
              * otherwise add it. */
+            // 获取到slave得地址后，创建redisinstance 准备链接slave
             if (sentinelRedisInstanceLookupSlave(ri,ip,atoi(port)) == NULL) {
                 if ((slave = createSentinelRedisInstance(NULL,SRI_SLAVE,ip,
                             atoi(port), ri->quorum, ri)) != NULL)
@@ -2114,6 +2129,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         else if (!memcmp(l,"role:slave",10)) role = SRI_SLAVE;
 
         if (role == SRI_SLAVE) {
+            // 当前ri是一个slave得链接, 更新 master相关数据
             /* master_host:<host> */
             if (sdslen(l) >= 12 && !memcmp(l,"master_host:",12)) {
                 if (ri->slave_master_host == NULL ||
@@ -2373,14 +2389,25 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
     char **token = sdssplitlen(hello, hello_len, ",", 1, &numtokens);
     sentinelRedisInstance *si, *master;
 
+    /*
+     * 当前sentinel从channel收到一条别得sentinel发送得消息。
+     * 调用者已经过滤掉自己发送得消息, 这条消息必然来自其他sentinel
+     * 收到得数据内容
+     * "%s,%d,%s,%llu," Info about this sentinel
+        "%s,%s,%d,%llu", Info about current master
+        announce_ip, announce_port, sentinel.myid, (unsigned long long) sentinel.current_epoch,
+        master->name,master_addr->ip,master_addr->port,(unsigned long long) master->config_epoch)
+     */
     if (numtokens == 8) {
         /* Obtain a reference to the master this hello message is about */
-        master = sentinelGetMasterByName(token[4]);
+        // 每个sentinel会监控多个master, 会有多个master的redisinstance
+        master = sentinelGetMasterByName(token[4]); // master->name
         if (!master) goto cleanup; /* Unknown master, skip the message. */
 
         /* First, try to see if we already have this sentinel. */
         port = atoi(token[1]);
         master_port = atoi(token[6]);
+        // 在此master中 找是否已经有此链接, 要比较addr和sentinel的id
         si = getSentinelRedisInstanceByAddrAndRunID(
                         master->sentinels,token[0],port,token[2]);
         current_epoch = strtoull(token[3],NULL,10);
@@ -2390,6 +2417,8 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
             /* If not, remove all the sentinels that have the same runid
              * because there was an address change, and add the same Sentinel
              * with the new address back. */
+            // runid被一个新得sentinel使用了，老得runid sentinel要被删除
+            // 正常应该最多只有一个
             removed = removeMatchingSentinelFromMaster(master,token[2]);
             if (removed) {
                 sentinelEvent(LL_NOTICE,"+sentinel-address-switch",master,
@@ -2399,6 +2428,7 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
                  * new one is reporting. What we do if this happens is to set its
                  * port to 0, to signal the address is invalid. We'll update it
                  * later if we get an HELLO message. */
+                // 只根据ip和端口查找
                 sentinelRedisInstance *other =
                     getSentinelRedisInstanceByAddrAndRunID(
                         master->sentinels, token[0],port,NULL);
@@ -2410,6 +2440,7 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
             }
 
             /* Add the new sentinel. */
+            // 添加一个sentinel，在timer中会主动链接此sentinel
             si = createSentinelRedisInstance(token[2],SRI_SENTINEL,
                             token[0],port,master->quorum,master);
 
@@ -2418,7 +2449,8 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
                 /* The runid is NULL after a new instance creation and
                  * for Sentinels we don't have a later chance to fill it,
                  * so do it now. */
-                si->runid = sdsnew(token[2]);
+                si->runid = sdsnew(token[2]); // runid 和 name 一样
+                // 因为一组sentinel可以监空多个master，sentinel之前的链接可能会有重复，因此可以共享
                 sentinelTryConnectionSharing(si);
                 if (removed) sentinelUpdateSentinelAddressInAllMasters(si);
                 sentinelFlushConfig();
@@ -2491,8 +2523,10 @@ void sentinelReceiveHelloMessages(redisAsyncContext *c, void *reply, void *privd
         strcmp(r->element[0]->str,"message") != 0) return;
 
     /* We are not interested in meeting ourselves */
+    // 当前sentinel向channel发送数据时，自己也会收到一份一样得。因为自己也sub了这个channel
     if (strstr(r->element[2]->str,sentinel.myid) != NULL) return;
 
+    // 处理收到别得sentinel publish过来得信息数据，主要是维护sentinel之间得链接
     sentinelProcessHelloMessage(r->element[2]->str, r->element[2]->len);
 }
 
@@ -2513,6 +2547,9 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
     int retval;
     char *announce_ip;
     int announce_port;
+    // 一个sentinel保持了和多个redis实例(master/slave)和多个sentinel得连接
+    // ri即是其中一个连接对象,注意每个连接对象(除sentinel外)实际都有2个sock连接，其中一个是pubsub
+    // 获取所属得master
     sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ? ri : ri->master;
     sentinelAddr *master_addr = sentinelGetCurrentMasterAddress(master);
 
@@ -2520,9 +2557,13 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
 
     /* Use the specified announce address if specified, otherwise try to
      * obtain our own IP address. */
+    // 使用announce得主要原因是由于端口或IP映射导致的无法连接的问题
+    // 例如 docker 这种容器，当你使用了端口映射后，运行在 docker 中的 redis 是不知道正真的端口或 IP 的
+    // 这点先不关注
     if (sentinel.announce_ip) {
         announce_ip = sentinel.announce_ip;
     } else {
+        // 使用getsockname 获取当前fd得ip
         if (anetSockName(ri->link->cc->c.fd,ip,sizeof(ip),NULL) == -1)
             return C_ERR;
         announce_ip = ip;
@@ -2539,6 +2580,8 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
         /* --- */
         master->name,master_addr->ip,master_addr->port,
         (unsigned long long) master->config_epoch);
+    // 通过channel把当前sentinel得addr 和 sentinel关联得master得地址发出去
+    // 其他已经sub此channel得sentinel会拿到一个新得sentinal地址，然后建立连接
     retval = redisAsyncCommand(ri->link->cc,
         sentinelPublishReplyCallback, ri, "PUBLISH %s %s",
             SENTINEL_HELLO_CHANNEL,payload);
@@ -2649,15 +2692,18 @@ void sentinelSendPeriodicCommands(sentinelRedisInstance *ri) {
         (now - ri->info_refresh) > info_period))
     {
         /* Send INFO to masters and slaves, not sentinels. */
+        // 从command连接获取 master/slave 得信息, 从master获取信息，应该需要链接master得各个slave
         retval = redisAsyncCommand(ri->link->cc,
             sentinelInfoReplyCallback, ri, "INFO");
         if (retval == C_OK) ri->link->pending_commands++;
     } else if ((now - ri->link->last_pong_time) > ping_period &&
                (now - ri->link->last_ping_time) > ping_period/2) {
         /* Send PING to all the three kinds of instances. */
+        // 对管理得一个链接ri 发送ping，ri可能是redis(master/slave) 也可能是sentinel
         sentinelSendPing(ri);
     } else if ((now - ri->last_pub_time) > SENTINEL_PUBLISH_PERIOD) {
         /* PUBLISH hello messages to all the three kinds of instances. */
+        // 通过指定channel发送当前sentinel得各个链接信息ri
         sentinelSendHello(ri);
     }
 }
@@ -4293,6 +4339,7 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     /* Every kind of instance */
     // 没有连接是先尝试连接redis实例
     sentinelReconnectInstance(ri);
+    // 定时通过固定得channel发送命令
     sentinelSendPeriodicCommands(ri);
 
     /* ============== ACTING HALF ============= */
@@ -4334,7 +4381,8 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
     di = dictGetIterator(instances);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
-        // 对每个监控得redis实例处理. 首次被调用时 instances 是未连接完成得master配置数据
+        // 对每个监控得redis实例处理.
+        // 首次被调用时 instances 是未连接完成得master配置数据
         sentinelHandleRedisInstance(ri);
         // 如果是连了master，还要连slave和其他sentinel
         if (ri->flags & SRI_MASTER) {
