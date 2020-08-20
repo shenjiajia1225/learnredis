@@ -637,6 +637,7 @@ void sentinelEvent(int level, char *type, sentinelRedisInstance *ri,
         serverLog(level,"%s %s",type,msg);
 
     /* Publish the message via Pub/Sub if it's not a debugging one. */
+    // 会发布这个信息, 只有订阅了此频道的才会受到
     if (level != LL_DEBUG) {
         channel = createStringObject(type,strlen(type));
         payload = createStringObject(msg,strlen(msg));
@@ -1295,6 +1296,7 @@ void releaseSentinelRedisInstance(sentinelRedisInstance *ri) {
 sentinelRedisInstance *sentinelRedisInstanceLookupSlave(
                 sentinelRedisInstance *ri, char *ip, int port)
 {
+    // ri 是一个master
     // slave 使用ip和端口来作为key
     sds key;
     sentinelRedisInstance *slave;
@@ -2235,7 +2237,7 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
              * election to perform this failover. This will force the other
              * Sentinels to update their config (assuming there is not
              * a newer one already available). */
-            // 已经知道这个redis的info信息了 进入下一个状态
+            // 已经知道这个redis的info信息了 进入下一个状态 SENTINEL_FAILOVER_STATE_RECONF_SLAVES
             ri->master->config_epoch = ri->master->failover_epoch;
             ri->master->failover_state = SENTINEL_FAILOVER_STATE_RECONF_SLAVES;
             ri->master->failover_state_change_time = mstime();
@@ -2275,6 +2277,8 @@ void sentinelRefreshInstanceInfo(sentinelRedisInstance *ri, const char *info) {
         (ri->slave_master_port != ri->master->addr->port ||
          strcasecmp(ri->slave_master_host,ri->master->addr->ip)))
     {
+        // slave 发现master的地址变了
+        // 准备连接新的master，即slave of newmaster
         mstime_t wait_time = ri->master->failover_timeout;
 
         /* Make sure the master is sane before reconfiguring this instance
@@ -3629,6 +3633,8 @@ void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
 
     if (master->flags & SRI_S_DOWN) {
         /* Is down for enough sentinels? */
+        // 初始设置为1，因为自己已经认为master S_DOWN了，后面在查找其他sentinel发来的master的状态值
+        // 来觉得是不是应该会到 O_DOWN
         quorum = 1; /* the current sentinel. */
         /* Count all the other sentinels. */
         // 已经主观下线了，检查其他监控此master的sentinel的标记
@@ -3638,7 +3644,7 @@ void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
             // SRI_MASTER_DOWN 标记怎么来的 ???
             // 在 sentinelAskMasterStateToOtherSentinels 中会向其他sentinel询问 master的状态
             // 考虑这种情况下消息流程：sentinel1, 2, 3 监控master，其中 s1, s2 连不通master，s3可以， s1, s2, s3互通
-            // 此时s1, s2都会标记主观下线。准备询问其他sentinel
+            // 此时s1, s2都会标记主观下线。准备询问其他sentinel, 此时当前sentinel的 其他sentinel链接对象的flags会被设置SRI_MASTER_DOWN标记
             if (ri->flags & SRI_MASTER_DOWN) quorum++;
         }
         dictReleaseIterator(di);
@@ -4255,6 +4261,8 @@ void sentinelFailoverSendSlaveOfNoOne(sentinelRedisInstance *ri) {
      * really care about the reply. We check if it worked indirectly observing
      * if INFO returns a different role (master instead of slave). */
     // 看注释，将slave变成一个master
+    // 故障转移的本质就是选其中一个slave 发送slaveof none 使其变成master
+    // 其他slave 发送 slave of newmaster 连接新得master
     retval = sentinelSendSlaveOf(ri->promoted_slave,NULL,0);
     if (retval != C_OK) return;
     sentinelEvent(LL_NOTICE, "+failover-state-wait-promotion",
@@ -4352,6 +4360,7 @@ void sentinelFailoverReconfNextSlave(sentinelRedisInstance *master) {
         sentinelRedisInstance *slave = dictGetVal(de);
 
         // SRI_RECONF_INPROG 在 info 命令中会设置
+        // SRI_RECONF_SENT会在发送完成命令后设置
         if (slave->flags & (SRI_RECONF_SENT|SRI_RECONF_INPROG))
             in_progress++;
     }
@@ -4424,21 +4433,26 @@ void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
 
     if (!(ri->flags & SRI_FAILOVER_IN_PROGRESS)) return;
 
-    // 开始处理故障转移了 ri是一个master redis 连接
+    // ODOWN 开始处理故障转移了 ri是一个master redis 连接
     switch(ri->failover_state) {
         case SENTINEL_FAILOVER_STATE_WAIT_START:
+            // 选举sentinel leader
             sentinelFailoverWaitStart(ri);
             break;
         case SENTINEL_FAILOVER_STATE_SELECT_SLAVE:
+            // leader选择要变成master得slave
             sentinelFailoverSelectSlave(ri);
             break;
         case SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE:
+            // 给选择得slave发送slave of none 使其变成一个master
             sentinelFailoverSendSlaveOfNoOne(ri);
             break;
         case SENTINEL_FAILOVER_STATE_WAIT_PROMOTION:
+            // 等待拉取到身份变更后得新master得info数据
             sentinelFailoverWaitPromotion(ri);
             break;
         case SENTINEL_FAILOVER_STATE_RECONF_SLAVES:
+            // 其他slave连接新得master
             sentinelFailoverReconfNextSlave(ri);
             break;
     }
@@ -4524,6 +4538,7 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
 /* Perform scheduled operations for all the instances in the dictionary.
  * Recursively call the function against dictionaries of slaves. */
 void sentinelHandleDictOfRedisInstances(dict *instances) {
+    // 时钟函数主逻辑 调用进来时 instances 为多个master对象
     dictIterator *di;
     dictEntry *de;
     sentinelRedisInstance *switch_to_promoted = NULL;
@@ -4586,6 +4601,7 @@ void sentinelCheckTiltCondition(void) {
 void sentinelTimer(void) {
     sentinelCheckTiltCondition();
     // 主动连接master. masters 的数据在 createSentinelRedisInstance 中创建(读取配置时被调用)
+    // 一组sentinel可以监控多个master，即管理多个master/slave 组
     sentinelHandleDictOfRedisInstances(sentinel.masters);
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
@@ -4597,6 +4613,7 @@ void sentinelTimer(void) {
      * exactly continue to stay synchronized asking to be voted at the
      * same time again and again (resulting in nobody likely winning the
      * election because of split brain voting). */
+    // desynchronize 去同步
     server.hz = CONFIG_DEFAULT_HZ + rand() % CONFIG_DEFAULT_HZ;
 }
 
