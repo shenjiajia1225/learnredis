@@ -1490,6 +1490,9 @@ int sentinelResetMastersByPattern(char *pattern, int flags) {
  * The function returns C_ERR if the address can't be resolved for some
  * reason. Otherwise C_OK is returned.  */
 int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip, int port) {
+    // 这里是改成 sentinel 监控 master/slaves 的地址
+    // 调用点不一样。对于leader sentinel,即处理failover逻辑的sentinel 会在  timer logic 中调用.
+    // 其他sentinel会在 hello channel收到 hello数据时调用
     sentinelAddr *oldaddr, *newaddr;
     sentinelAddr **slaves = NULL;
     int numslaves = 0, j;
@@ -1501,6 +1504,7 @@ int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip,
 
     /* Make a list of slaves to add back after the reset.
      * Don't include the one having the address we are switching to. */
+    // 把原来的所有的slave加入到 新的slave表中，注意要去除变成master的那个slave
     di = dictGetIterator(master->slaves);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *slave = dictGetVal(de);
@@ -1515,6 +1519,7 @@ int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip,
     /* If we are switching to a different address, include the old address
      * as a slave as well, so that we'll be able to sense / reconfigure
      * the old master. */
+    // 在把原来的master 加入到slave表中，即master变成了slave
     if (!sentinelAddrIsEqual(newaddr,master->addr)) {
         slaves = zrealloc(slaves,sizeof(sentinelAddr*)*(numslaves+1));
         slaves[numslaves++] = createSentinelAddr(master->addr->ip,
@@ -1529,6 +1534,7 @@ int sentinelResetMasterAndChangeAddress(sentinelRedisInstance *master, char *ip,
     master->s_down_since_time = 0;
 
     /* Add slaves back. */
+    // 重新加入slave
     for (j = 0; j < numslaves; j++) {
         sentinelRedisInstance *slave;
 
@@ -2494,10 +2500,12 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
 
         /* Update master info if received configuration is newer. */
         if (si && master->config_epoch < master_config_epoch) {
+            // 在failover过程中，s2，s3获取到的 master name还是老的那个 但是 addr已经是新的master addr了(slave1的地址)
             master->config_epoch = master_config_epoch;
             if (master_port != master->addr->port ||
                 strcmp(master->addr->ip, token[5]))
             {
+                // 到这里发现master的地址变了，是因为slave1变成了master
                 sentinelAddr *old_addr;
 
                 sentinelEvent(LL_WARNING,"+config-update-from",si,"%@");
@@ -2507,6 +2515,7 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
                     master->addr->ip, master->addr->port,
                     token[5], master_port);
 
+                // old_addr就是老的master地址 token[5,6] 是新的地址(slave1)
                 old_addr = dupSentinelAddr(master->addr);
                 sentinelResetMasterAndChangeAddress(master, token[5], master_port);
                 sentinelCallClientReconfScript(master,
@@ -2578,6 +2587,8 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
     // ri即是其中一个连接对象,注意每个连接对象(除sentinel外)实际都有2个sock连接，其中一个是pubsub
     // 获取所属得master
     sentinelRedisInstance *master = (ri->flags & SRI_MASTER) ? ri : ri->master;
+    // !!! 注意下面的函数 sentinelGetCurrentMasterAddress 会获取master地址 或是 被提升为master的slave的地址
+    // 对s1来说 他会把slave1的地址作为master的地址publish出去
     sentinelAddr *master_addr = sentinelGetCurrentMasterAddress(master);
 
     if (ri->link->disconnected) return C_ERR;
@@ -2609,6 +2620,7 @@ int sentinelSendHello(sentinelRedisInstance *ri) {
         (unsigned long long) master->config_epoch);
     // 通过channel把当前sentinel得addr 和 sentinel关联得master得地址发出去
     // 其他已经sub此channel得sentinel会拿到一个新得sentinal地址，然后建立连接
+    // 在failover过程中，这里publish出去的master的信息 可能是老的master的名字 和 新的master的地址
     retval = redisAsyncCommand(ri->link->cc,
         sentinelPublishReplyCallback, ri, "PUBLISH %s %s",
             SENTINEL_HELLO_CHANNEL,payload);
@@ -4033,6 +4045,7 @@ int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
     /* Failover already in progress? */
     // 已经在failover过程中了 则不用继续
     // 也即不会再执行 sentinelStartFailover , 该函数会增加 epoch 值
+    // sentinelStartFailover中会设置 SRI_FAILOVER_IN_PROGRESS 标记，因此正常只会被调用一次
     if (master->flags & SRI_FAILOVER_IN_PROGRESS) return 0;
 
     /* Last failover attempt started too little time ago? */
