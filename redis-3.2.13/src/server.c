@@ -1207,6 +1207,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         // WNOHANG = return immediately if no child has exited
         // waitpid() waits only for terminated children
         if ((pid = wait3(&statloc,WNOHANG,NULL)) != 0) {
+            // 等到子进程结束了 要获取下信号和进程结束码
             int exitcode = WEXITSTATUS(statloc);
             int bysignal = 0;
 
@@ -1234,6 +1235,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         }
     } else {
         // 没有任何存盘进程存在，检查配置的save参数，准备调用存盘
+        // 例如 save 300 10 服务器在>=300秒，对数据库执行了至少10修改
         /* If there is not a background saving/rewrite in progress check if
          * we have to save/rewrite now */
          for (j = 0; j < server.saveparamslen; j++) {
@@ -1249,6 +1251,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                  CONFIG_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == C_OK))
             {
+                // lastbgsave_status 表示上一次bgsave是否成功的标记
+                // 满足一个存盘条件后就可以了, 注意dirty的变化
                 serverLog(LL_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, (int)sp->seconds);
                 rdbSaveBackground(server.rdb_filename);
@@ -1256,6 +1260,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
          }
 
+         // 如果上面已经触发执行了 rdbSaveBackground , 下面的条件不在满足
          /* Trigger an AOF rewrite if needed */
          if (server.rdb_child_pid == -1 &&
              server.aof_child_pid == -1 &&

@@ -219,6 +219,7 @@ char *zstrdup(const char *s) {
 }
 
 size_t zmalloc_used_memory(void) {
+    // 获得总的分配的内存数量
     size_t um;
 
     if (zmalloc_thread_safe) {
