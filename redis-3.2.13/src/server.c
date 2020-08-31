@@ -1223,6 +1223,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 // master 执行bgsave结束
                 backgroundSaveDoneHandler(exitcode,bysignal);
             } else if (pid == server.aof_child_pid) {
+                // 后台aof rewrite结束了
                 backgroundRewriteDoneHandler(exitcode,bysignal);
             } else {
                 if (!ldbRemoveChild(pid)) {
@@ -1271,6 +1272,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             long long base = server.aof_rewrite_base_size ?
                             server.aof_rewrite_base_size : 1;
             long long growth = (server.aof_current_size*100/base) - 100;
+            // aof_rewrite_perc 默认为100
+            // aof_rewrite_base_size 初始为0，之后为上一次rewrite后的文件最新的size
+            // 此条件可以认为当前的size 和 上一次size的一个百分比(分式展开合并)
+            // aof_current_size 当前aof文件大小，是一个始终增长的值
+            // aof_rewrite_min_size 默认是64M
+            // 即当aof文件大于64M后，每次aofsize翻倍后执行一次rewrite
             if (growth >= server.aof_rewrite_perc) {
                 serverLog(LL_NOTICE,"Starting automatic rewriting of AOF on %lld%% growth",growth);
                 rewriteAppendOnlyFileBackground();
@@ -1281,6 +1288,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* AOF postponed(延迟) flush: Try at every cron cycle if the slow fsync
      * completed. */
+    // 有此标记时表示 之前一个触发write aof时 因为有后台job正在fsync aof文件, 因此一个write请求被延迟了。
+    // 因此这里这里重新进入函数检查是否可以进行write操作了。
     if (server.aof_flush_postponed_start) flushAppendOnlyFile(0);
 
     /* AOF write errors: in this case we have a buffer to flush as well and
