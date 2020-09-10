@@ -3829,6 +3829,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
         // 注意这里会发送 当前故障转移的一个类似版本一样的数据 epoch 
         //
         // 注意已经在failover的leader也会不停的询问其他sentinel关于master的状态，即不停的在请求投票
+        // 这里不断请求投票，其实是一种维持自己“统治权”
         ll2string(port,sizeof(port),master->addr->port);
         retval = redisAsyncCommand(ri->link->cc,
                     sentinelReceiveIsMasterDownReply, ri,

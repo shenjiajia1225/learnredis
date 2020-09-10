@@ -249,7 +249,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     server.slaveseldb = dictid;
 
     /* Write the command to the replication backlog if any. */
-    // 所有command都要写入backlog
+    // 所有command都要写入backlog, 表示有些slave正在等待bgsave结束
     if (server.repl_backlog) {
         // 当有slave连接上来后就会创建repl_backlog, 处理普通命令后需要将命令发送给slave
         // 这里先写repl_backlog
@@ -279,7 +279,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     }
 
     /* Write the command to every slave. */
-    // 同时把所有command准备发送给所有slave
+    // 同时把所有command准备发送给所有slave, 注意发送给所有不需要等待bgsave的slave
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
@@ -700,6 +700,7 @@ void syncCommand(client *c) {
     if (server.repl_disable_tcp_nodelay)
         anetDisableTcpNoDelay(NULL, c->fd); /* Non critical if it fails. */
     c->repldbfd = -1;
+    // 当前client连接是一个slave，设置标记并加入到slaves表里
     c->flags |= CLIENT_SLAVE;
     // 将当前连接加入到slave链表里
     listAddNodeTail(server.slaves,c);
@@ -718,6 +719,8 @@ void syncCommand(client *c) {
 
         // 加入之前有个slave已经请求了全量同步，此时新的一个slave连接上来也请求同步（假如也是全量）
         // 先找到之前请求同步的那个slave，根据slave的状态查找
+        // 注意普通的rdb子进程启动时 也会满足上面的if条件，如果此时master确实也有slave，但是这些slave
+        // 本身已经不需要同步了，新的slave client c 请求同步数据时 会走到这里. 考虑此情况[MASTER CONN1]
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             slave = ln->value;
@@ -725,10 +728,12 @@ void syncCommand(client *c) {
         }
         /* To attach this slave, we check that it has at least all the
          * capabilities of the slave that triggered the current BGSAVE. */
+        // 情况[MASTER CONN1]时 ln会是空指针，因此只能等待下一个bgsave
         if (ln && ((c->slave_capa & slave->slave_capa) == slave->slave_capa)) {
             /* Perfect, the server is already registering differences for
              * another slave. Set the right state, and copy the buffer. */
             // 找到后，将之前slave已经缓存的数据(bgsave过程中master又处理的命令)拷贝一份到自己的缓存中
+            // (选择到一个slave，将当前的新的slave的数据和选择到的保持一致)
             copyClientOutputBuffer(c,slave);
             // 设置状态为等待BGSAVE结束, 回复一个消息 +FULLRESYNC
             // 对于此slave的后续处理和之前的slave一样
@@ -1026,6 +1031,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                     serverLog(LL_WARNING,"SYNC failed. Can't open/stat DB after BGSAVE: %s", strerror(errno));
                     continue;
                 }
+                // 设置发送的长度和偏移
                 slave->repldboff = 0;
                 slave->repldbsize = buf.st_size;
                 // 这里重新设置slave得repl得状态, 设置文件的长度, 准备发送
@@ -1610,6 +1616,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         sdsfree(err);
         server.repl_state = REPL_STATE_SEND_AUTH; // 没有问题，状态改为等待和master认证
+        // 设置完状态后直接执行下面的if判断了
     }
 
     /* AUTH with the master if required. */
@@ -1674,7 +1681,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (server.repl_state == REPL_STATE_SEND_IP &&
         server.slave_announce_ip == NULL)
     {
-            server.repl_state = REPL_STATE_SEND_CAPA;
+        server.repl_state = REPL_STATE_SEND_CAPA;
     }
 
     /* Set the slave ip, so that Master's INFO command can list the
@@ -1904,6 +1911,11 @@ int cancelReplicationHandshake(void) {
     } else if (server.repl_state == REPL_STATE_CONNECTING ||
                slaveIsInHandshakeState())
     {
+        // 如果一个slave给master发送了PSYNC 此时repl_state == REPL_STATE_RECEIVE_PSYNC
+        // 但是一直没有收到master的答复，导致超时，重置当前slave的repl_state
+        // 可以让repl的时钟函数 replicationCron 触发重连master, 重新走一遍认证流程。即后面
+        // 会重新在发送PSYNC命令。master不答复可能是因为master正在执行一个bgsave，但是类型是socket或是此bgsave和slave没有关系等。
+        // 具体见 syncCommand 函数中的处理。
         undoConnectWithMaster();
         server.repl_state = REPL_STATE_CONNECT;
     } else {
@@ -1923,6 +1935,7 @@ void replicationSetMaster(char *ip, int port) {
     replicationDiscardCachedMaster(); /* Don't try a PSYNC. */
     freeReplicationBacklog(); /* Don't allow our chained slaves to PSYNC. */
     cancelReplicationHandshake();
+    // 设置状态
     server.repl_state = REPL_STATE_CONNECT;
     server.master_repl_offset = 0; // 设置slave的offset
     server.repl_down_since = 0;

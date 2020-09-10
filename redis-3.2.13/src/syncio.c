@@ -51,6 +51,7 @@ ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
     long long start = mstime();
     long long remaining = timeout;
 
+    // 同步写数据
     while(1) {
         long long wait = (remaining > SYNCIO__RESOLUTION) ?
                           remaining : SYNCIO__RESOLUTION;
@@ -68,6 +69,9 @@ ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout) {
         if (size == 0) return ret;
 
         /* Wait */
+        // 注意这里等待wait时间 fd 可写
+        // 到这里 是因为上面的write没有将数据全部写入系统发送缓存
+        // 等待一定时间后尝试再次写入
         aeWait(fd,AE_WRITABLE,wait);
         elapsed = mstime() - start;
         if (elapsed >= timeout) {
