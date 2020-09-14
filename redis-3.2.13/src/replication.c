@@ -1097,6 +1097,11 @@ void replicationCreateMasterClient(int fd) {
     server.repl_state = REPL_STATE_CONNECTED;
     // rdb同步完成后，将初始请求sync时 master当前的总命令长度保存到reploff中
     // 这时候 正常reploff <= master.master_repl_offset
+    // repl_master_initial_offset 是在请求全量同步时master发送过来的当时的 master_repl_offset的值
+    // 当slave同步收master的rdb内容完成后，会使用 readQueryFromClient 继续接受master在rdb过程中缓存的client其他命令。
+    // 此时更新c->reploff的数据
+    // createClient创建出来的client即为server.master, 此client对read事件使用readQueryFromClient处理，内部更新c->reploff
+    // 也即更新server.master.reploff，因此会和master的 master_repl_offset保持一致。
     server.master->reploff = server.repl_master_initial_offset;
     memcpy(server.master->replrunid, server.repl_master_runid,
         sizeof(server.repl_master_runid));
@@ -1442,6 +1447,7 @@ int slaveTryPartialResynchronization(int fd, int read_reply) {
             // 有缓存的master信息时，需要将offset和master的 runid=redis启动实例id 发送给master，用于对比
             // 有可能redis重启了，或是master换人了
             // 将之前缓存得reploff发送给master  这里要+1 ?
+            // server.cached_master->reploff是连接断开前的一个记录标记点。
             psync_runid = server.cached_master->replrunid;
             snprintf(psync_offset,sizeof(psync_offset),"%lld", server.cached_master->reploff+1);
             serverLog(LL_NOTICE,"Trying a partial resynchronization (request %s:%s).", psync_runid, psync_offset);
@@ -1906,6 +1912,7 @@ void replicationAbortSyncTransfer(void) {
  * Otherwise zero is returned and no operation is perforemd at all. */
 int cancelReplicationHandshake(void) {
     if (server.repl_state == REPL_STATE_TRANSFER) {
+        // 正在同步rdb数据过程中超时了
         replicationAbortSyncTransfer();
         server.repl_state = REPL_STATE_CONNECT;
     } else if (server.repl_state == REPL_STATE_CONNECTING ||
@@ -2477,6 +2484,7 @@ void replicationCron(void) {
     if (server.masterhost && server.repl_state == REPL_STATE_CONNECTED &&
         (time(NULL)-server.master->lastinteraction) > server.repl_timeout)
     {
+        // 已经同步完成的情况下 和master通讯timeout了
         serverLog(LL_WARNING,"MASTER timeout: no data nor PING received...");
         freeClient(server.master);
     }
