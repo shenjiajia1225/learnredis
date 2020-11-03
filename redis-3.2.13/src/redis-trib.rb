@@ -669,6 +669,8 @@ class RedisTrib
         # likely that the instance is running in a different physical host
         # or at least a different virtual machine.
         ips = {}
+        # :host属性是在newnode时设置的, 由脚本参数调用时传入
+        # 相同ip内可能包含多个node节点
         @nodes.each{|n|
             ips[n.info[:host]] = [] if !ips[n.info[:host]]
             ips[n.info[:host]] << n
@@ -678,6 +680,8 @@ class RedisTrib
         puts "Using #{masters_count} masters:"
         interleaved = []
         stop = false
+        # 每个ip中取一个node出来作为候选的master node
+        # 多次循环保证取到足够量的master
         while not stop do
             # Take one node from each IP until we run out of nodes
             # across every IP.
@@ -711,6 +715,7 @@ class RedisTrib
                 last = ClusterHashSlots-1
             end
             last = first if last < first # Min step is 1.
+            # 给master设置slots 这里设置好本地数据
             n.add_slots first..last
             first = last+1
             cursor += slots_per_node
@@ -755,6 +760,7 @@ class RedisTrib
                     else
                         slave = interleaved.shift
                     end
+                    # 配置好当前slave的master
                     slave.set_as_replica(m.info[:name])
                     nodes_count -= 1
                     assigned_replicas += 1
@@ -1275,10 +1281,10 @@ class RedisTrib
         end
     end
 
-    def create_cluster_cmd(argv,opt)
+    # 测试命令
+    def test_cluster_cmd(argv,opt)
         opt = {'replicas' => 0}.merge(opt)
         @replicas = opt['replicas'].to_i
-
         xputs ">>> Creating cluster"
         argv[0..-1].each{|n|
             node = ClusterNode.new(n)
@@ -1292,7 +1298,32 @@ class RedisTrib
         xputs ">>> Performing hash slots allocation on #{@nodes.length} nodes..."
         alloc_slots
         show_nodes
+        #yes_or_die "Can I set the above configuration?"
+        #flush_nodes_config
+    end
+
+    # 创建集群命令
+    def create_cluster_cmd(argv,opt)
+        opt = {'replicas' => 0}.merge(opt)
+        @replicas = opt['replicas'].to_i
+
+        # 连接每个node节点，发送nodes命令获取node信息
+        xputs ">>> Creating cluster"
+        argv[0..-1].each{|n|
+            node = ClusterNode.new(n)
+            node.connect(:abort => true)
+            node.assert_cluster
+            node.load_info # 获取node相关信息
+            node.assert_empty
+            add_node(node)
+        }
+        check_create_parameters
+        xputs ">>> Performing hash slots allocation on #{@nodes.length} nodes..."
+        # 本地分配好master/slave 设置好master的slots 设置好slave的master节点
+        alloc_slots
+        show_nodes
         yes_or_die "Can I set the above configuration?"
+        # 相关配置数据发送到远端node
         flush_nodes_config
         xputs ">>> Nodes configuration updated"
         xputs ">>> Assign a different config epoch to each node"
@@ -1654,7 +1685,8 @@ COMMANDS={
     "set-timeout" => ["set_timeout_cluster_cmd", 3, "host:port milliseconds"],
     "call" =>    ["call_cluster_cmd", -3, "host:port command arg arg .. arg"],
     "import" =>  ["import_cluster_cmd", 2, "host:port"],
-    "help"    => ["help_cluster_cmd", 1, "(show this help)"]
+    "help"    => ["help_cluster_cmd", 1, "(show this help)"],
+    "test"  => ["test_cluster_cmd", -2, "host1:port1 ... hostN:portN"]
 }
 
 ALLOWED_OPTIONS={
@@ -1664,6 +1696,7 @@ ALLOWED_OPTIONS={
     "reshard" => {"from" => true, "to" => true, "slots" => true, "yes" => false, "timeout" => true, "pipeline" => true},
     "rebalance" => {"weight" => [], "auto-weights" => false, "use-empty-masters" => false, "timeout" => true, "simulate" => false, "pipeline" => true, "threshold" => true},
     "fix" => {"timeout" => MigrateDefaultTimeout},
+    "test" => {"replicas" => true},
 }
 
 def show_help

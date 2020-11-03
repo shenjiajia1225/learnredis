@@ -28,6 +28,34 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * 1. 多个cluster连接 (master slave)
+ *    单个节点空配置启动
+ *    单节点主从
+ *    新加入节点时连接问题
+ * 2. 新增/移除cluster节点时 槽位迁移过程 (迁移过程中的查询处理)
+ * 3. 故障处理
+ *
+ * ruby create cluster 步骤 (作为client连接到各个node,发送命令进行配置)
+ * 命令实例：redis-trib.rb create --replicas 1 127.0.0.1:6379 127.0.0.1:6380 127.0.0.1:6381 127.0.0.1:6382 127.0.0.1:6383 127.0.0.1:6384
+ * alloc_slots
+ *   (1) 选择多个node作为master 根据ip选择 尽量不在同一个ip中
+ *   (2) 分配slots
+ *   (3) 对选择的slave使用 replicate 命令设置主从模式, 见 clusterCommand 函数
+ *   这里只是配置好相关关系
+ * flush_nodes_config
+ *   发送命令: 针对master发送addslots 针对slave发送replicate,
+ *   注意这里的flush操作发送replicate应该是没有作用的, 因为此时各个redis之间还没有连通，因此主要是用来设置master的slots
+ * assign_config_epoch
+ *   发送命令：set-config-epoch
+ * join_cluster
+ *   发送命令: meet 建立cluster连接, 脚本中所有其他节点给第一个节点发送meet命令. 利用 gossip 协议保证节点间都互联
+ * wait_cluster_join
+ *   发送命令：针对每个节点发送命令nodes 用于获取每个节点上返回的 集群节点信息, 当所有集群几点返回的信息一致时表示join完成
+ * flush_nodes_config
+ *   再次flush，这里其实主要是设置slave节点，因为上面的join_cluster已经保证了节点直接连接完成了
+ */
+
 #include "server.h"
 #include "cluster.h"
 #include "endianconv.h"
@@ -404,6 +432,7 @@ void clusterInit(void) {
     server.cluster->myself = NULL;
     server.cluster->currentEpoch = 0;
     server.cluster->state = CLUSTER_FAIL;
+    // 初始化时设置只有一个节点
     server.cluster->size = 1;
     server.cluster->todo_before_sleep = 0;
     server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
@@ -426,9 +455,12 @@ void clusterInit(void) {
         exit(1);
 
     /* Load or create a new nodes configuration. */
+    // 加载cluster节点信息，注意首次启动时此文件不存在或为空
     if (clusterLoadConfig(server.cluster_configfile) == C_ERR) {
         /* No configuration found. We will just use the random name provided
          * by the createClusterNode() function. */
+        // 创建myself节点 下面会save到配置文件中 node-xxx.conf
+        // 注意新启动的节点都会设置为master
         myself = server.cluster->myself =
             createClusterNode(NULL,CLUSTER_NODE_MYSELF|CLUSTER_NODE_MASTER);
         serverLog(LL_NOTICE,"No cluster configuration found, I'm %.40s",
@@ -453,6 +485,8 @@ void clusterInit(void) {
         exit(1);
     }
 
+    // 开启一个新端口用于通讯, 其他cluster连接. 消息处理 clusterAcceptHandler
+    // 注意新端口的端口号为 redis服务端口号 + 10000
     if (listenToPort(server.port+CLUSTER_PORT_INCR,
         server.cfd,&server.cfd_count) == C_ERR)
     {
@@ -475,8 +509,12 @@ void clusterInit(void) {
      * the IP address via MEET messages. */
     myself->port = server.port;
 
+    // 新的cluster节点启动的时候不会有slots,和slave.和其他cluster节点信息
+    // cluster建立连接依赖 meet 协议. 由ruby脚本完成。
     server.cluster->mf_end = 0;
     resetManualFailover();
+
+    serverLog( LL_DEBUG, "[XX][%s][%d] myself name[%s] flag[%d]", __FUNCTION__, __LINE__, myself->name, myself->flags );
 }
 
 /* Reset a node performing a soft or hard reset:
@@ -1237,6 +1275,7 @@ int clusterHandshakeInProgress(char *ip, int port) {
  * EAGAIN - There is already an handshake in progress for this address.
  * EINVAL - IP or port are not valid. */
 int clusterStartHandshake(char *ip, int port) {
+    // 当前节点主动去连接 目标ip:port的节点
     clusterNode *n;
     char norm_ip[NET_IP_STR_LEN];
     struct sockaddr_storage sa;
@@ -1273,6 +1312,7 @@ int clusterStartHandshake(char *ip, int port) {
             (void*)&(((struct sockaddr_in6 *)&sa)->sin6_addr),
             norm_ip,NET_IP_STR_LEN);
 
+    // 检查是否存在同ip port的节点正在handshake中
     if (clusterHandshakeInProgress(norm_ip,port)) {
         errno = EAGAIN;
         return 0;
@@ -1281,10 +1321,13 @@ int clusterStartHandshake(char *ip, int port) {
     /* Add the node with a random address (NULL as first argument to
      * createClusterNode()). Everything will be fixed during the
      * handshake. */
+    // 注意新创建节点的flag, 具体的连接逻辑等在clusterCron中完成
     n = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE|CLUSTER_NODE_MEET);
     memcpy(n->ip,norm_ip,sizeof(n->ip));
     n->port = port;
     clusterAddNode(n);
+    serverLog( LL_DEBUG, "[XX][%s][%d] node name[%s] flag[%d] addr[%s:%d]", __FUNCTION__, __LINE__,
+        n->name, n->flags, n->ip, n->port );
     return 1;
 }
 
@@ -1296,6 +1339,9 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
     uint16_t count = ntohs(hdr->count);
     clusterMsgDataGossip *g = (clusterMsgDataGossip*) hdr->data.ping.gossip;
     clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender);
+
+    serverLog( LL_DEBUG, "[XX][%s][%d] hdr port[%d] name[%s] flags[%d] count[%d]", __FUNCTION__, __LINE__,
+        ntohs(hdr->port), hdr->sender, ntohs(hdr->flags), count );
 
     while(count--) {
         uint16_t flags = ntohs(g->flags);
@@ -1314,6 +1360,8 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
 
         /* Update our state accordingly to the gossip sections */
         node = clusterLookupNode(g->nodename);
+        serverLog( LL_DEBUG, "[XX][%s][%d] gossip addr[%s:%d] name[%s] flags[%d] count[%d] find[%d]", __FUNCTION__, __LINE__,
+            g->ip, ntohs(g->port), g->nodename, flags, count, node?1:0 );
         if (node) {
             /* We already know this node.
                Handle failure reports, only when the sender is a master. */
@@ -1360,6 +1408,8 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                 !(flags & CLUSTER_NODE_NOADDR) &&
                 !clusterBlacklistExists(g->nodename))
             {
+                // gossip内容里如果有其他节点的话 也要尝试连接过去
+                // 这样可以保证经过几次ping互发消息后 cluster中的节点能相互连通
                 clusterStartHandshake(g->ip,ntohs(g->port));
             }
         }
@@ -1543,6 +1593,7 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
  * processing lead to some inconsistency error (for instance a PONG
  * received from the wrong sender ID). */
 int clusterProcessPacket(clusterLink *link) {
+    // 处理 clusterSendPing 发来的内容
     clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
     uint32_t totlen = ntohl(hdr->totlen);
     uint16_t type = ntohs(hdr->type);
@@ -1600,8 +1651,13 @@ int clusterProcessPacket(clusterLink *link) {
         if (totlen != explen) return 1;
     }
 
+    // 首次meet的ping消息过来时应该是找不到此node的
     /* Check if the sender is a known node. */
     sender = clusterLookupNode(hdr->sender);
+
+    serverLog( LL_DEBUG, "[XX][%s][%d] sender name[%s]type[%d] find[%d]", __FUNCTION__, __LINE__,
+        hdr->sender, type, sender?1:0 );
+
     if (sender && !nodeInHandshake(sender)) {
         /* Update our curretEpoch if we see a newer epoch in the cluster. */
         senderCurrentEpoch = ntohu64(hdr->currentEpoch);
@@ -1666,6 +1722,7 @@ int clusterProcessPacket(clusterLink *link) {
          * flags, slaveof pointer, and so forth, as this details will be
          * resolved when we'll receive PONGs from the node. */
         if (!sender && type == CLUSTERMSG_TYPE_MEET) {
+            // 首次meet节点到这里，加入clusternodes
             clusterNode *node;
 
             node = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE);
@@ -1673,6 +1730,9 @@ int clusterProcessPacket(clusterLink *link) {
             node->port = ntohs(hdr->port);
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+
+            serverLog( LL_DEBUG, "[XX][%s][%d] MEET first from node[%s:%d] name[%s] flags[%d]", __FUNCTION__, __LINE__,
+                node->ip, node->port, node->name, node->flags );
         }
 
         /* If this is a MEET packet from an unknown node, we still process
@@ -1710,7 +1770,7 @@ int clusterProcessPacket(clusterLink *link) {
                     clusterDelNode(link->node);
                     return 0;
                 }
-
+                // 这里会第一次处理收到的PONG消息
                 /* First thing to do is replacing the random name with the
                  * right node name if this was a handshake stage. */
                 clusterRenameNode(link->node, hdr->sender);
@@ -1719,6 +1779,10 @@ int clusterProcessPacket(clusterLink *link) {
                 link->node->flags &= ~CLUSTER_NODE_HANDSHAKE;
                 link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+
+                serverLog( LL_DEBUG, "[XX][%s][%d] MEET Pong from node[%s:%d] name[%s] flags[%d]", __FUNCTION__, __LINE__,
+                    link->node->ip, link->node->port, link->node->name, link->node->flags );
+
             } else if (memcmp(link->node->name,hdr->sender,
                         CLUSTER_NAMELEN) != 0)
             {
@@ -1883,6 +1947,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
 
         /* Get info from the gossip section */
+        // 处理协议内容
         if (sender) clusterProcessGossipSection(hdr,link);
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
         clusterNode *failing;
@@ -2234,6 +2299,9 @@ void clusterSendPing(clusterLink *link, int type) {
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
 
+    serverLog( LL_DEBUG, "[XX][%s][%d] node name[%s]flag[%d]addr[%s:%d] type[%d] freshnodes[%d] wanted[%d]", __FUNCTION__, __LINE__,
+        link->node->name, link->node->flags, link->node->ip, link->node->port, type, freshnodes, wanted );
+
     /* Populate the gossip fields */
     int maxiterations = wanted*3;
     while(freshnodes > 0 && gossipcount < wanted && maxiterations--) {
@@ -2282,6 +2350,9 @@ void clusterSendPing(clusterLink *link, int type) {
         gossip->notused1 = 0;
         gossip->notused2 = 0;
         gossipcount++;
+
+        serverLog( LL_DEBUG, "[XX][%s][%d] gossip_node name[%s]flag[%d]addr[%s:%d]", __FUNCTION__, __LINE__,
+            this->name, this->flags, this->ip, this->port );
     }
 
     /* Ready to send... fix the totlen fiend and queue the message in the
@@ -3085,6 +3156,10 @@ void clusterCron(void) {
     handshake_timeout = server.cluster_node_timeout;
     if (handshake_timeout < 1000) handshake_timeout = 1000;
 
+    // clusterInit 完成后 一个新的cluster节点暂时没有其他信息
+    // 此时cluster->nodes中只有myself节点
+    // meet命令可以给redis节点添加 nodes
+
     /* Check if we have disconnected nodes and re-establish the connection. */
     di = dictGetSafeIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
@@ -3100,6 +3175,7 @@ void clusterCron(void) {
         }
 
         if (node->link == NULL) {
+            // 要建立连接
             int fd;
             mstime_t old_ping_sent;
             clusterLink *link;
@@ -3119,6 +3195,7 @@ void clusterCron(void) {
                     server.neterr);
                 continue;
             }
+            // 连接成功了. 对应accept的处理里面也会设置read事件回调函数 clusterReadHandler
             link = createClusterLink(node);
             link->fd = fd;
             node->link = link;
@@ -3131,6 +3208,7 @@ void clusterCron(void) {
              * of a PING one, to force the receiver to add us in its node
              * table. */
             old_ping_sent = node->ping_sent;
+            // 首次发送meet
             clusterSendPing(link, node->flags & CLUSTER_NODE_MEET ?
                     CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
             if (old_ping_sent) {
@@ -3154,6 +3232,7 @@ void clusterCron(void) {
 
     /* Ping some random node 1 time every 10 iterations, so that we usually ping
      * one random node every second. */
+    // 每10次迭代 会选5个节点ping
     if (!(iteration % 10)) {
         int j;
 
@@ -3423,6 +3502,7 @@ int clusterNodeGetSlotBit(clusterNode *n, int slot) {
 int clusterAddSlot(clusterNode *n, int slot) {
     if (server.cluster->slots[slot]) return C_ERR;
     clusterNodeSetSlotBit(n,slot);
+    // 设置某个槽位对应的node
     server.cluster->slots[slot] = n;
     return C_OK;
 }
@@ -3655,6 +3735,7 @@ void clusterSetMaster(clusterNode *n) {
             clusterNodeRemoveSlave(myself->slaveof,myself);
     }
     myself->slaveof = n;
+    // 设置master slave相关信息
     clusterNodeAddSlave(n,myself);
     replicationSetMaster(n->ip, n->port);
     resetManualFailover();
@@ -3702,6 +3783,7 @@ sds clusterGenNodeDescription(clusterNode *node) {
     int j, start;
     sds ci;
 
+    // 一条节点配置信息 name ip:port flags 主从信息 其他信息
     /* Node coordinates */
     ci = sdscatprintf(sdsempty(),"%.40s %s:%d ",
         node->name,
@@ -3759,6 +3841,7 @@ sds clusterGenNodeDescription(clusterNode *node) {
             }
         }
     }
+    serverLog( LL_DEBUG, "[XX][%s][%d] ci[%s]", __FUNCTION__, __LINE__, ci );
     return ci;
 }
 
@@ -3775,6 +3858,7 @@ sds clusterGenNodeDescription(clusterNode *node) {
  * of the CLUSTER NODES function, and as format for the cluster
  * configuration file (nodes.conf) for a given node. */
 sds clusterGenNodesDescription(int filter) {
+    // 获取集群的一个nodes列表信息
     sds ci = sdsempty(), ni;
     dictIterator *di;
     dictEntry *de;
@@ -3898,6 +3982,8 @@ void clusterCommand(client *c) {
             return;
         }
 
+        serverLog( LL_DEBUG, "[XX][%s][%d] meet flag[%d] target[%s:%lld]", __FUNCTION__, __LINE__, myself->flags, (char*)c->argv[2]->ptr, port );
+
         if (clusterStartHandshake(c->argv[2]->ptr,port) == 0 &&
             errno == EINVAL)
         {
@@ -3908,6 +3994,8 @@ void clusterCommand(client *c) {
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"nodes") && c->argc == 2) {
         /* CLUSTER NODES */
+        // 获取nodes信息，脚本创建集群时会请求此命令
+        serverLog( LL_DEBUG, "[XX][%s][%d] cmd=nodes myflags[%d]", __FUNCTION__, __LINE__, myself->flags );
         robj *o;
         sds ci = clusterGenNodesDescription(0);
 
@@ -3937,6 +4025,8 @@ void clusterCommand(client *c) {
         int j, slot;
         unsigned char *slots = zmalloc(CLUSTER_SLOTS);
         int del = !strcasecmp(c->argv[1]->ptr,"delslots");
+
+        serverLog( LL_DEBUG, "[XX][%s][%d] addslots flag[%d] del[%d]argc[%d]", __FUNCTION__, __LINE__, myself->flags, del, c->argc );
 
         memset(slots,0,CLUSTER_SLOTS);
         /* Check that all the arguments are parseable and that all the
@@ -3971,6 +4061,7 @@ void clusterCommand(client *c) {
                 if (server.cluster->importing_slots_from[j])
                     server.cluster->importing_slots_from[j] = NULL;
 
+                // 给自己配置slots相关信息
                 retval = del ? clusterDelSlot(j) :
                                clusterAddSlot(myself,j);
                 serverAssertWithInfo(c,NULL,retval == C_OK);
@@ -4201,8 +4292,9 @@ void clusterCommand(client *c) {
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc == 3) {
         /* CLUSTER REPLICATE <NODE ID> */
+        // 当前节点时一个slave，设置成slave节点, n 是一个master
         clusterNode *n = clusterLookupNode(c->argv[2]->ptr);
-
+        serverLog( LL_DEBUG, "[XX][%s][%d] replicate flag[%d] master[%s]find[%d]", __FUNCTION__, __LINE__, myself->flags, (char*)c->argv[2]->ptr, n?1:0 );
         /* Lookup the specified node in our table. */
         if (!n) {
             addReplyErrorFormat(c,"Unknown node %s", (char*)c->argv[2]->ptr);
@@ -4338,6 +4430,8 @@ void clusterCommand(client *c) {
 
         if (getLongLongFromObjectOrReply(c,c->argv[2],&epoch,NULL) != C_OK)
             return;
+
+        serverLog( LL_DEBUG, "[XX][%s][%d] set-config-epoch flag[%d] epoch[%lld]", __FUNCTION__, __LINE__, myself->flags, epoch );
 
         if (epoch < 0) {
             addReplyErrorFormat(c,"Invalid config epoch specified: %lld",epoch);
