@@ -50,6 +50,9 @@
  *   发送命令：set-config-epoch
  * join_cluster
  *   发送命令: meet 建立cluster连接, 脚本中所有其他节点给第一个节点发送meet命令. 利用 gossip 协议保证节点间都互联
+ *   !!! node之间都是双向连接的 !!!
+ *   节点和节点直接会定时发送ping, 发送时会随机带上自己已经有的一些节点信息.多次循环迭代后最终每个node都会知道其他node,
+ *   最终每个node都会主动去连接其他node.
  * wait_cluster_join
  *   发送命令：针对每个节点发送命令nodes 用于获取每个节点上返回的 集群节点信息, 当所有集群几点返回的信息一致时表示join完成
  * flush_nodes_config
@@ -642,8 +645,11 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
          * Initiallly the link->node pointer is set to NULL as we don't know
          * which node is, but the right node is references once we know the
          * node identity. */
+        // accept后只创建link不创建node
         link = createClusterLink(NULL);
         link->fd = cfd;
+        serverLog( LL_DEBUG, "[XX][%s][%d] accept node fd[%d] link[%p]", __FUNCTION__, __LINE__,
+            cfd, (void*)link );
         aeCreateFileEvent(server.el,cfd,AE_READABLE,clusterReadHandler,link);
     }
 }
@@ -716,6 +722,8 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->repl_offset_time = 0;
     node->repl_offset = 0;
     listSetFreeMethod(node->fail_reports,zfree);
+    serverLog( LL_DEBUG, "[XX][%s][%d] nodename[%s] name[%s] flags[%d]", __FUNCTION__, __LINE__,
+        nodename ? nodename : "", node->name, node->flags );
     return node;
 }
 
@@ -1655,8 +1663,8 @@ int clusterProcessPacket(clusterLink *link) {
     /* Check if the sender is a known node. */
     sender = clusterLookupNode(hdr->sender);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] sender name[%s]type[%d] find[%d]", __FUNCTION__, __LINE__,
-        hdr->sender, type, sender?1:0 );
+    serverLog( LL_DEBUG, "[XX][%s][%d] sender name[%s]type[%d] find[%d] fromlink[%p]", __FUNCTION__, __LINE__,
+        hdr->sender, type, sender?1:0, (void*)link );
 
     if (sender && !nodeInHandshake(sender)) {
         /* Update our curretEpoch if we see a newer epoch in the cluster. */
@@ -1691,6 +1699,7 @@ int clusterProcessPacket(clusterLink *link) {
 
     /* Initial processing of PING and MEET requests replying with a PONG. */
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
+        // 刚accept的连接发来的meet时 link->node是空的
         serverLog(LL_DEBUG,"Ping packet received: %p", (void*)link->node);
 
         /* We use incoming MEET messages in order to set the address
@@ -1722,7 +1731,11 @@ int clusterProcessPacket(clusterLink *link) {
          * flags, slaveof pointer, and so forth, as this details will be
          * resolved when we'll receive PONGs from the node. */
         if (!sender && type == CLUSTERMSG_TYPE_MEET) {
-            // 首次meet节点到这里，加入clusternodes
+            // 首次收到meet到这里，加入clusternodes
+            // 这里没有关联 link 和 node
+            // 当下一次clusterCron时会主动去连接对端的node.
+            // 也即 node直接互联都是需要主动去连接对方的.连接成功后发送meet,对方回一个pong
+            // 然后更新自己这个node的name
             clusterNode *node;
 
             node = createClusterNode(NULL,CLUSTER_NODE_HANDSHAKE);
@@ -1756,6 +1769,9 @@ int clusterProcessPacket(clusterLink *link) {
             if (nodeInHandshake(link->node)) {
                 /* If we already have this node, try to change the
                  * IP/port of the node with the new one. */
+                // 正在handshake中的两个节点，先发送了meet的节点收到了pong回复
+                // 此时pong里面的nodename 和 本地node的name是不一致的，所以sender也找不到
+                // 本地是一个临时的name，需要用pong消息里的sender替换掉
                 if (sender) {
                     serverLog(LL_VERBOSE,
                         "Handshake: we already know node %.40s, "
@@ -1780,7 +1796,7 @@ int clusterProcessPacket(clusterLink *link) {
                 link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
 
-                serverLog( LL_DEBUG, "[XX][%s][%d] MEET Pong from node[%s:%d] name[%s] flags[%d]", __FUNCTION__, __LINE__,
+                serverLog( LL_DEBUG, "[XX][%s][%d] MEET Pong from node[%s:%d] final_name[%s] flags[%d]", __FUNCTION__, __LINE__,
                     link->node->ip, link->node->port, link->node->name, link->node->flags );
 
             } else if (memcmp(link->node->name,hdr->sender,
@@ -1813,6 +1829,7 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* Update our info about the node */
         if (link->node && type == CLUSTERMSG_TYPE_PONG) {
+            // 发送meet后第一此收到pong也会到这里
             link->node->pong_received = mstime();
             link->node->ping_sent = 0;
 
@@ -1832,6 +1849,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
 
         /* Check for role switch: slave -> master or master -> slave. */
+        // 首次发送meet后收到pong时 sender是空的
         if (sender) {
             if (!memcmp(hdr->slaveof,CLUSTER_NODE_NULL_NAME,
                 sizeof(hdr->slaveof)))
@@ -2299,7 +2317,7 @@ void clusterSendPing(clusterLink *link, int type) {
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] node name[%s]flag[%d]addr[%s:%d] type[%d] freshnodes[%d] wanted[%d]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] targetnode name[%s]flag[%d]addr[%s:%d] pingtype[%d] freshnodes[%d] wanted[%d]", __FUNCTION__, __LINE__,
         link->node->name, link->node->flags, link->node->ip, link->node->port, type, freshnodes, wanted );
 
     /* Populate the gossip fields */
@@ -3196,9 +3214,12 @@ void clusterCron(void) {
                 continue;
             }
             // 连接成功了. 对应accept的处理里面也会设置read事件回调函数 clusterReadHandler
+            // 主动发起连接的一方 link和node关联
             link = createClusterLink(node);
             link->fd = fd;
             node->link = link;
+            serverLog( LL_DEBUG, "[XX][%s][%d] connect node[%s:%d] success flag[%d] selfflag[%d] with-link[%p]", __FUNCTION__, __LINE__,
+                node->ip, node->port, node->flags, myself->flags, (void*)link );
             aeCreateFileEvent(server.el,link->fd,AE_READABLE,
                     clusterReadHandler,link);
             /* Queue a PING in the new connection ASAP: this is crucial
@@ -3224,6 +3245,9 @@ void clusterCron(void) {
              * normal PING packets. */
             node->flags &= ~CLUSTER_NODE_MEET;
 
+            serverLog( LL_DEBUG, "[XX][%s][%d] connect node[%s:%d] done flag[%d] selfflag[%d]", __FUNCTION__, __LINE__,
+                node->ip, node->port, node->flags, myself->flags );
+
             serverLog(LL_DEBUG,"Connecting with Node %.40s at %s:%d",
                     node->name, node->ip, node->port+CLUSTER_PORT_INCR);
         }
@@ -3232,7 +3256,7 @@ void clusterCron(void) {
 
     /* Ping some random node 1 time every 10 iterations, so that we usually ping
      * one random node every second. */
-    // 每10次迭代 会选5个节点ping
+    // 每10次迭代 会选1个节点ping
     if (!(iteration % 10)) {
         int j;
 
@@ -3476,6 +3500,7 @@ int clusterNodeSetSlotBit(clusterNode *n, int slot) {
          * migration tagets if the rest of the cluster is not a slave-less.
          *
          * See https://github.com/antirez/redis/issues/3043 for more info. */
+        // TODO look
         if (n->numslots == 1 && clusterMastersHaveSlaves())
             n->flags |= CLUSTER_NODE_MIGRATE_TO;
     }
@@ -3973,6 +3998,7 @@ void clusterCommand(client *c) {
         return;
     }
 
+    serverLog( LL_DEBUG, "[XX][%s][%d] cmd=[%s] myflags[%d]", __FUNCTION__, __LINE__, (char*)c->argv[1]->ptr, myself->flags );
     if (!strcasecmp(c->argv[1]->ptr,"meet") && c->argc == 4) {
         long long port;
 
@@ -3995,7 +4021,6 @@ void clusterCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr,"nodes") && c->argc == 2) {
         /* CLUSTER NODES */
         // 获取nodes信息，脚本创建集群时会请求此命令
-        serverLog( LL_DEBUG, "[XX][%s][%d] cmd=nodes myflags[%d]", __FUNCTION__, __LINE__, myself->flags );
         robj *o;
         sds ci = clusterGenNodesDescription(0);
 

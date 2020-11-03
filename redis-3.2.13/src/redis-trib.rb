@@ -801,6 +801,7 @@ class RedisTrib
                 n.r.cluster("set-config-epoch",config_epoch)
             rescue
             end
+            # 每个node的epoch都不一样
             config_epoch += 1
         }
     end
@@ -811,6 +812,7 @@ class RedisTrib
         # about the very same node.
         # Thanks to gossip this information should propagate across all the
         # cluster in a matter of seconds.
+        # 给每个节点都发送meet第一个节点
         first = false
         @nodes.each{|n|
             if !first then first = n.info; next; end # Skip the first node
@@ -1298,8 +1300,13 @@ class RedisTrib
         xputs ">>> Performing hash slots allocation on #{@nodes.length} nodes..."
         alloc_slots
         show_nodes
-        #yes_or_die "Can I set the above configuration?"
-        #flush_nodes_config
+        yes_or_die "Can I set the above configuration?"
+        flush_nodes_config
+        assign_config_epoch
+        join_cluster
+        sleep 1
+        wait_cluster_join
+        xputs ">>> Join cluster done"
     end
 
     # 创建集群命令
@@ -1323,7 +1330,8 @@ class RedisTrib
         alloc_slots
         show_nodes
         yes_or_die "Can I set the above configuration?"
-        # 相关配置数据发送到远端node
+        # 相关配置数据发送到远端node. 首次调用时主要给master设置slots. slave设置replicate会失败
+        # 因为当前还不知道其他节点情况
         flush_nodes_config
         xputs ">>> Nodes configuration updated"
         xputs ">>> Assign a different config epoch to each node"
