@@ -2317,8 +2317,9 @@ void clusterSendPing(clusterLink *link, int type) {
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] targetnode name[%s]flag[%d]addr[%s:%d] pingtype[%d] freshnodes[%d] wanted[%d]", __FUNCTION__, __LINE__,
-        link->node->name, link->node->flags, link->node->ip, link->node->port, type, freshnodes, wanted );
+    serverLog( LL_DEBUG, "[XX][%s][%d] targetnode fd[%d] pingtype[%d] freshnodes[%d] wanted[%d] node[%s:%s:%d]", __FUNCTION__, __LINE__,
+        link->fd, type, freshnodes, wanted,
+        link->node?link->node->name:"", link->node?link->node->ip:"", link->node?link->node->port:0 );
 
     /* Populate the gossip fields */
     int maxiterations = wanted*3;
@@ -3751,6 +3752,10 @@ void clusterSetMaster(clusterNode *n) {
     serverAssert(n != myself);
     serverAssert(myself->numslots == 0);
 
+    serverLog( LL_DEBUG, "[XX][%s][%d] before myself[%s:%s:%d]flag[%d] master[%s:%s:%d]flag[%d]", __FUNCTION__, __LINE__,
+        myself->name, myself->ip, myself->port, myself->flags,
+        n->name, n->ip, n->port, n->flags );
+
     if (nodeIsMaster(myself)) {
         myself->flags &= ~(CLUSTER_NODE_MASTER|CLUSTER_NODE_MIGRATE_TO);
         myself->flags |= CLUSTER_NODE_SLAVE;
@@ -3764,6 +3769,10 @@ void clusterSetMaster(clusterNode *n) {
     clusterNodeAddSlave(n,myself);
     replicationSetMaster(n->ip, n->port);
     resetManualFailover();
+
+    serverLog( LL_DEBUG, "[XX][%s][%d] after myself[%s:%s:%d]flag[%d] master[%s:%s:%d]flag[%d]", __FUNCTION__, __LINE__,
+        myself->name, myself->ip, myself->port, myself->flags,
+        n->name, n->ip, n->port, n->flags );
 }
 
 /* -----------------------------------------------------------------------------
@@ -4353,6 +4362,7 @@ void clusterCommand(client *c) {
         clusterSetMaster(n);
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
+        serverLog( LL_DEBUG, "[XX][%s][%d] ===============================================================", __FUNCTION__, __LINE__ );
     } else if (!strcasecmp(c->argv[1]->ptr,"slaves") && c->argc == 3) {
         /* CLUSTER SLAVES <NODE ID> */
         clusterNode *n = clusterLookupNode(c->argv[2]->ptr);

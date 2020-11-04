@@ -1301,12 +1301,14 @@ class RedisTrib
         alloc_slots
         show_nodes
         yes_or_die "Can I set the above configuration?"
-        flush_nodes_config
+        flush_nodes_config # 给master设置slots
         assign_config_epoch
         join_cluster
         sleep 1
         wait_cluster_join
         xputs ">>> Join cluster done"
+        flush_nodes_config # 设置replicate
+        xputs ">>> All done"
     end
 
     # 创建集群命令
@@ -1484,7 +1486,7 @@ class RedisTrib
         xputs ">>> Importing data from #{source_addr} to cluster #{argv[1]}"
         use_copy = opt['copy']
         use_replace = opt['replace']
-        
+
         # Check the existing cluster.
         load_cluster_info_from_node(argv[0])
         check_cluster
