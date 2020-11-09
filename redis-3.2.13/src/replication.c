@@ -669,7 +669,7 @@ void syncCommand(client *c) {
      * So the slave knows the new runid and offset to try a PSYNC later
      * if the connection with the master is lost. */
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
-        // [REPL SM 005] master收到psync命令
+        // [REPL SM 005] master收到psync命令. slave请求同步发送的是 PSYNC 命令
         if (masterTryPartialResynchronization(c) == C_OK) {
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
@@ -1593,6 +1593,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
         /* Send the PING, don't check for errors at all, we have the timeout
          * that will take care about this. */
         // [REPL SM 001] 发送PING消息。对于master来说，当前slave和普通client没有区别, master 会回复一个 PONG（pingCommand）
+        // 发送ping消息只是为了检测master是否运行正常
         err = sendSynchronousCommand(SYNC_CMD_WRITE,fd,"PING",NULL);
         if (err) goto write_error;
         return;
@@ -1750,6 +1751,7 @@ void syncWithMaster(aeEventLoop *el, int fd, void *privdata, int mask) {
     if (server.repl_state == REPL_STATE_SEND_PSYNC) {
         // 到这里 一些认证和配置设置完成了，发送一个psync命令给master
         // [REPL SM 005] slave第一次发送给master同步数据请求, 注意第二个参数是0表示发送消息
+        // 对应master在 syncCommand 中处理psync命令
         if (slaveTryPartialResynchronization(fd,0) == PSYNC_WRITE_ERROR) {
             err = sdsnew("Write error sending the PSYNC command.");
             goto write_error;
@@ -2491,6 +2493,7 @@ void replicationCron(void) {
 
     /* Check if we should connect to a MASTER */
     if (server.repl_state == REPL_STATE_CONNECT) {
+        // 给node设置好此状态和masterhost masterport后，执行到这里准备连接master
         serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
             server.masterhost, server.masterport);
         if (connectWithMaster() == C_OK) {

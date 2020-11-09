@@ -33,6 +33,8 @@
  *    单个节点空配置启动
  *    单节点主从
  *    新加入节点时连接问题
+ *    cluster 下 set 等流程
+ *      processCommand 中对client命令预处理时会检查是否开启了cluster模式, 后面转入 getNodeByQuery 检查
  * 2. 新增/移除cluster节点时 槽位迁移过程 (迁移过程中的查询处理)
  * 3. 故障处理
  *
@@ -3767,6 +3769,7 @@ void clusterSetMaster(clusterNode *n) {
     myself->slaveof = n;
     // 设置master slave相关信息
     clusterNodeAddSlave(n,myself);
+    // 设置完master-slave后，replicationCron 在定时器中也会被调用
     replicationSetMaster(n->ip, n->port);
     resetManualFailover();
 
