@@ -2439,7 +2439,7 @@ int processCommand(client *c) {
      * However we don't perform the redirection if:
      * 1) The sender of this command is our master.
      * 2) The command has no key arguments. */
-    // cluster模式下走这里
+    // 处理来自客户端的命令，cluster模式下走这里
     if (server.cluster_enabled &&
         !(c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_LUA &&

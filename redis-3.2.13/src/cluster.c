@@ -29,6 +29,7 @@
  */
 
 /*
+ * cluster本质上只是对所有的key划分到不同redis节点中, 只是增加了动态key变更 和 故障处理
  * 1. 多个cluster连接 (master slave)
  *    单个节点空配置启动
  *    单节点主从
@@ -36,6 +37,15 @@
  *    cluster 下 set 等流程
  *      processCommand 中对client命令预处理时会检查是否开启了cluster模式, 后面转入 getNodeByQuery 检查
  * 2. 新增/移除cluster节点时 槽位迁移过程 (迁移过程中的查询处理)
+ *    (1)新增节点使用 add-node 命令, 新增节点后，节点只是加入了集群，但是没有任何功能.(除非新增时作为一个slave加入)
+ *       ./redis-trib.rb add-node 127.0.0.1:6374 127.0.0.1:6371 最后一个节点为集群中的任意节点，用于标识要加入的集群
+ *       最后通过MEET消息加入(client给当前连接的node发送meet命令，触发当前node执行clusterCommand中的meet命令处理，
+ *       最终执行handshark给另一个node发送CLUSTER_NODE_MEET, 从而相互识别达到加入集群目的)
+ *    (2)槽位迁移, 单个槽位迁移步骤
+ *        a. targetNode >> cluster setslot SLOTID importing sourceNodeID
+ *        b. sourceNode >> cluster setslot SLOTID migrating targetNodeID
+ *        c. sourceNode >> cluster MIGRATE targethost targetport "" dbid timeout KEYS key1 key2 ... keyN
+ *        d. anyNode    >> cluster setslot SLOTID node targetNodeID
  * 3. 故障处理
  *
  * ruby create cluster 步骤 (作为client连接到各个node,发送命令进行配置)

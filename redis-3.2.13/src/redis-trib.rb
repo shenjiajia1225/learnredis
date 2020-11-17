@@ -366,7 +366,9 @@ class RedisTrib
         keys = 0
         @nodes.each{|n|
             if n.has_flag?("master")
-                puts "#{n} (#{n.info[:name][0...8]}...) -> #{n.r.dbsize} keys | #{n.slots.length} slots | "+
+                #puts "#{n} (#{n.info[:name][0...8]}...) -> #{n.r.dbsize} keys | #{n.slots.length} slots | "+
+                #     "#{n.info[:replicas].length} slaves."
+                puts "#{n} (#{n.info[:name]}) -> #{n.r.dbsize} keys | #{n.slots.length} slots | "+
                      "#{n.info[:replicas].length} slaves."
                 masters += 1
                 keys += n.r.dbsize
@@ -1249,6 +1251,7 @@ class RedisTrib
             exit 1
         end
 
+        # 上面配置一些参数
         puts "\nReady to move #{numslots} slots."
         puts "  Source nodes:"
         sources.each{|s| puts "    "+s.info_string}
@@ -1354,6 +1357,7 @@ class RedisTrib
         check_cluster
     end
 
+    # 将节点node加入到集群中, 只负责加入节点, 新节点没有功能，可以分配槽位(master)或当从节点(slave)
     def addnode_cluster_cmd(argv,opt)
         xputs ">>> Adding node #{argv[0]} to cluster #{argv[1]}"
 
