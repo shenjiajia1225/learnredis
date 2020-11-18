@@ -36,7 +36,7 @@
  *    新加入节点时连接问题
  *    cluster 下 set 等流程
  *      processCommand 中对client命令预处理时会检查是否开启了cluster模式, 后面转入 getNodeByQuery 检查
- * 2. 新增/移除cluster节点时 槽位迁移过程 (迁移过程中的查询处理)
+ * 2. 新增节点时 槽位迁移过程 (迁移过程中的查询处理)
  *    (1)新增节点使用 add-node 命令, 新增节点后，节点只是加入了集群，但是没有任何功能.(除非新增时作为一个slave加入)
  *       ./redis-trib.rb add-node 127.0.0.1:6374 127.0.0.1:6371 最后一个节点为集群中的任意节点，用于标识要加入的集群
  *       最后通过MEET消息加入(client给当前连接的node发送meet命令，触发当前node执行clusterCommand中的meet命令处理，
@@ -45,8 +45,12 @@
  *        a. targetNode >> cluster setslot SLOTID importing sourceNodeID
  *        b. sourceNode >> cluster setslot SLOTID migrating targetNodeID
  *        c. sourceNode >> cluster MIGRATE targethost targetport "" dbid timeout KEYS key1 key2 ... keyN
+ *          实际调用 migrateCommand
  *        d. anyNode    >> cluster setslot SLOTID node targetNodeID
- * 3. 故障处理
+ *    (3)给新的master节点配置一个slave节点
+ *        newSlaveNode >> cluster replicate masterID
+ * 3. 移除节点
+ * 4. 故障处理
  *
  * ruby create cluster 步骤 (作为client连接到各个node,发送命令进行配置)
  * 命令实例：redis-trib.rb create --replicas 1 127.0.0.1:6379 127.0.0.1:6380 127.0.0.1:6381 127.0.0.1:6382 127.0.0.1:6383 127.0.0.1:6384
@@ -4118,10 +4122,10 @@ void clusterCommand(client *c) {
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"setslot") && c->argc >= 4) {
-        /* SETSLOT 10 MIGRATING <node ID> */
-        /* SETSLOT 10 IMPORTING <node ID> */
+        /* SETSLOT 10 MIGRATING <node ID> */ // 迁移槽的源节点执行此命令, node ID 是目标节点
+        /* SETSLOT 10 IMPORTING <node ID> */ // 迁移槽的目标节点执行此命令, node ID 是源节点
         /* SETSLOT 10 STABLE */
-        /* SETSLOT 10 NODE <node ID> */
+        /* SETSLOT 10 NODE <node ID> */ // 任意节点执行, 用于通知内部所有节点此slot的拥有者节点
         int slot;
         clusterNode *n;
 
@@ -4133,6 +4137,8 @@ void clusterCommand(client *c) {
         if ((slot = getSlotOrReply(c,c->argv[2])) == -1) return;
 
         if (!strcasecmp(c->argv[3]->ptr,"migrating") && c->argc == 5) {
+            // 迁移槽的源节点执行此命令, 即将要把槽slot的数据迁移到 nodeID
+            // 检查是否拥有此槽位
             if (server.cluster->slots[slot] != myself) {
                 addReplyErrorFormat(c,"I'm not the owner of hash slot %u",slot);
                 return;
@@ -4142,8 +4148,11 @@ void clusterCommand(client *c) {
                     (char*)c->argv[4]->ptr);
                 return;
             }
+            // 记录迁移信息
             server.cluster->migrating_slots_to[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"importing") && c->argc == 5) {
+            // 迁移槽的目标节点执行此命令, 即将要从nodeID 迁移槽slot到本地
+            // 先检查本地是否有此槽位
             if (server.cluster->slots[slot] == myself) {
                 addReplyErrorFormat(c,
                     "I'm already the owner of hash slot %u",slot);
@@ -4154,6 +4163,7 @@ void clusterCommand(client *c) {
                     (char*)c->argv[4]->ptr);
                 return;
             }
+            // 记录槽位迁移信息
             server.cluster->importing_slots_from[slot] = n;
         } else if (!strcasecmp(c->argv[3]->ptr,"stable") && c->argc == 4) {
             /* CLUSTER SETSLOT <SLOT> STABLE */
@@ -4161,6 +4171,8 @@ void clusterCommand(client *c) {
             server.cluster->migrating_slots_to[slot] = NULL;
         } else if (!strcasecmp(c->argv[3]->ptr,"node") && c->argc == 5) {
             /* CLUSTER SETSLOT <SLOT> NODE <NODE ID> */
+            // 迁移数据结束后 通知集群 slot 属于 node
+            // 所有节点都会收到此消息。
             clusterNode *n = clusterLookupNode(c->argv[4]->ptr);
 
             if (!n) {
@@ -4181,6 +4193,7 @@ void clusterCommand(client *c) {
             /* If this slot is in migrating status but we have no keys
              * for it assigning the slot to another node will clear
              * the migratig status. */
+            // 迁移出数据的节点清之前记录的migrate信息
             if (countKeysInSlot(slot) == 0 &&
                 server.cluster->migrating_slots_to[slot])
                 server.cluster->migrating_slots_to[slot] = NULL;
@@ -4190,6 +4203,7 @@ void clusterCommand(client *c) {
             if (n == myself &&
                 server.cluster->importing_slots_from[slot])
             {
+                // 接受迁移数据的目标节点清之前记录的import数据
                 /* This slot was manually migrated, set this node configEpoch
                  * to a new epoch so that the new version can be propagated
                  * by the cluster.
@@ -4205,6 +4219,7 @@ void clusterCommand(client *c) {
                 }
                 server.cluster->importing_slots_from[slot] = NULL;
             }
+            // 重新设置slot的拥有者
             clusterDelSlot(slot);
             clusterAddSlot(n,slot);
         } else {
@@ -4623,6 +4638,7 @@ void restoreCommand(client *c) {
     int j, type, replace = 0;
     robj *obj;
 
+    // 先解析replace参数
     /* Parse additional options */
     for (j = 4; j < c->argc; j++) {
         if (!strcasecmp(c->argv[j]->ptr,"replace")) {
@@ -4633,6 +4649,7 @@ void restoreCommand(client *c) {
         }
     }
 
+    // 如果没有设置replace选项, 但是自己又有此key时，返回错误
     /* Make sure this key does not already exist here... */
     if (!replace && lookupKeyWrite(c->db,c->argv[1]) != NULL) {
         addReply(c,shared.busykeyerr);
@@ -4668,6 +4685,8 @@ void restoreCommand(client *c) {
     /* Create the key and set the TTL if any */
     dbAdd(c->db,c->argv[1],obj);
     if (ttl) setExpire(c->db,c->argv[1],mstime()+ttl);
+    // 此key被改动了, 要通知到watch此key的几个client
+    // 在 execCommand 时会检查标记
     signalModifiedKey(c->db,c->argv[1]);
     addReply(c,shared.ok);
     server.dirty++;
@@ -4817,6 +4836,8 @@ void migrateCommand(client *c) {
     replace = 0;
 
     /* Parse additional options */
+    // 如果指定了 COPY 选项，表示不删除源节点上的key
+    // 如果指定了 REPLACE 选项，替换目标节点上已存在的key（如果存在）
     for (j = 6; j < c->argc; j++) {
         if (!strcasecmp(c->argv[j]->ptr,"copy")) {
             copy = 1;
@@ -4829,8 +4850,9 @@ void migrateCommand(client *c) {
                     " must be set to the empty string");
                 return;
             }
+            // keys参数后面都是各个要迁移的 key
             first_key = j+1;
-            num_keys = c->argc - j - 1;
+            num_keys = c->argc - j - 1; // 可以计算出key的数量
             break; /* All the remaining args are keys. */
         } else {
             addReply(c,shared.syntaxerr);
@@ -4855,6 +4877,7 @@ void migrateCommand(client *c) {
     kv = zrealloc(kv,sizeof(robj*)*num_keys);
     int oi = 0;
 
+    // 取出要迁移的 key 和 对应的value
     for (j = 0; j < num_keys; j++) {
         if ((ov[oi] = lookupKeyRead(c->db,c->argv[first_key+j])) != NULL) {
             kv[oi] = c->argv[first_key+j];
@@ -4871,6 +4894,7 @@ void migrateCommand(client *c) {
 try_again:
     write_error = 0;
 
+    // 从当前节点迁移slot到目标节点(argv[1],argv[2])
     /* Connect */
     cs = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
     if (cs == NULL) {
@@ -4888,6 +4912,7 @@ try_again:
         serverAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,dbid));
     }
 
+    // 把要迁移的数据打包到cmd中
     /* Create RESTORE payload and generate the protocol to call the command. */
     for (j = 0; j < num_keys; j++) {
         long long ttl = 0;
@@ -4897,6 +4922,10 @@ try_again:
             ttl = expireat-mstime();
             if (ttl < 1) ttl = 1;
         }
+        // 注意replace选项要发送给对端, 如果有replace选项会多传一个 REPLACE 命令，因此这里要设置好参数个数
+        // 给迁移目标节点发送restore命令 , 对应处理函数 restoreCommand
+        // 这里源节点模拟了一个普通客户端连接到一个redis server, 发送select , restore等命令
+        // 用于选择db和保存key-value数据
         serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',replace ? 5 : 4));
         if (server.cluster_enabled)
             serverAssertWithInfo(c,NULL,
@@ -4923,6 +4952,7 @@ try_again:
     }
 
     /* Transfer the query to the other node in 64K chunks. */
+    // 同步发送给目标点
     errno = 0;
     {
         sds buf = cmd.io.buffer.ptr;
@@ -4943,6 +4973,7 @@ try_again:
     char buf1[1024]; /* Select reply. */
     char buf2[1024]; /* Restore reply. */
 
+    // 有select db的情况下先读select的返回数据
     /* Read the SELECT reply if needed. */
     if (select && syncReadLine(cs->fd, buf1, sizeof(buf1), timeout) <= 0)
         goto socket_err;
@@ -4969,6 +5000,7 @@ try_again:
             }
         } else {
             if (!copy) {
+                // 没有指定copy选项，删除当前节点上已经迁移的key
                 /* No COPY option: remove the local key, signal the change. */
                 dbDelete(c->db,kv[j]);
                 signalModifiedKey(c->db,kv[j]);
@@ -5002,6 +5034,7 @@ try_again:
         if (del_idx > 1) {
             newargv[0] = createStringObject("DEL",3);
             /* Note that the following call takes ownership of newargv. */
+            // 将此c中的命令替换为 del 一系列key，后续的调用函数会处理,例如aof会记录命令等
             replaceClientCommandVector(c,del_idx,newargv);
             argv_rewritten = 1;
         } else {
