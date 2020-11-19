@@ -1272,6 +1272,45 @@ class RedisTrib
         }
     end
 
+    def migrate_cluster_cmd(argv,opt)
+        opt = {'pipeline' => MigrateDefaultPipeline}.merge(opt)
+
+        load_cluster_info_from_node(argv[0])
+        check_cluster
+        if @errors.length != 0
+            puts "ERROR: Please fix your cluster problems before resharding"
+            exit 1
+        end
+
+        source = nil
+        while not source
+            print "What is the srouce node ID? "
+            source = get_node_by_name(STDIN.gets.chop)
+            if !source || source.has_flag?("slave")
+                xputs "ERROR: The specified node is not known or not a master, please retry."
+                target = nil
+            end
+        end
+        target = nil
+        while not target
+            print "What is the receiving node ID? "
+            target = get_node_by_name(STDIN.gets.chop)
+            if !target || target.has_flag?("slave")
+                xputs "ERROR: The specified node is not known or not a master, please retry."
+                target = nil
+            end
+        end
+        slot = 0
+        while slot <= 0 or slot > ClusterHashSlots
+            print "Which slot do you want to move (from 1 to #{ClusterHashSlots})? "
+            slot = STDIN.gets.to_i
+        end
+        puts "\nReady to move slot #{slot}"
+        puts "\nsource:\t#{source.info_string}"
+        puts "\ntarget:\t#{target.info_string}"
+        move_slot(source, target, slot, :dots=>true, :pipeline=>opt['pipeline'])
+    end
+
     # This is an helper function for create_cluster_cmd that verifies if
     # the number of nodes and the specified replicas have a valid configuration
     # where there are at least three master nodes and enough replicas per node.
@@ -1402,6 +1441,46 @@ class RedisTrib
         xputs "[OK] New node added correctly."
     end
 
+    def addnode_cluster_cmd_ex(argv,opt)
+        xputs ">>> Adding node #{argv[0]} to cluster #{argv[1]}"
+
+        # Check the existing cluster
+        load_cluster_info_from_node(argv[1])
+        check_cluster
+        if @errors.length != 0
+            puts "ERROR: Please fix your cluster problems before resharding"
+            exit 1
+        end
+
+        # Add the new node
+        new = ClusterNode.new(argv[0])
+        new.connect(:abort => true)
+        new.assert_cluster
+        new.load_info
+        new.assert_empty
+        first = @nodes.first.info
+        add_node(new)
+
+        # Send CLUSTER MEET command to the new node
+        xputs ">>> Send CLUSTER MEET to node #{new} to make it join the cluster."
+        new.r.cluster("meet",first[:host],first[:port])
+
+        print "Input masterid for new node as a slave or it will be a new master? "
+        node = get_node_by_name(STDIN.gets.chop)
+        if !node
+            xputs "[OK] New node added and will be a new master!"
+            exit 0
+        end
+        if node.has_flag?("slave")
+            xputs "ERROR: The specified node is not a master."
+            exit 1
+        end
+        wait_cluster_join
+        xputs ">>> Configure node as replica of #{node}."
+        new.r.cluster("replicate", node.info[:name])
+        xputs "[OK] New slave node added correctly."
+    end
+
     def delnode_cluster_cmd(argv,opt)
         id = argv[1].downcase
         xputs ">>> Removing node #{id} from cluster #{argv[0]}"
@@ -1423,6 +1502,7 @@ class RedisTrib
         end
 
         # Send CLUSTER FORGET to all the nodes but the node to remove
+        # 注意这里是要给所有节点发送forget命令的
         xputs ">>> Sending CLUSTER FORGET messages to the cluster..."
         @nodes.each{|n|
             next if n == node
@@ -1700,7 +1780,10 @@ COMMANDS={
     "call" =>    ["call_cluster_cmd", -3, "host:port command arg arg .. arg"],
     "import" =>  ["import_cluster_cmd", 2, "host:port"],
     "help"    => ["help_cluster_cmd", 1, "(show this help)"],
-    "test"  => ["test_cluster_cmd", -2, "host1:port1 ... hostN:portN"]
+
+    "test"  => ["test_cluster_cmd", -2, "host1:port1 ... hostN:portN"],
+    "migrate"  => ["migrate_cluster_cmd", 2, "host:port"],
+    "addnode" => ["addnode_cluster_cmd_ex", 3, "new_host:new_port existing_host:existing_port"]
 }
 
 ALLOWED_OPTIONS={
@@ -1710,7 +1793,10 @@ ALLOWED_OPTIONS={
     "reshard" => {"from" => true, "to" => true, "slots" => true, "yes" => false, "timeout" => true, "pipeline" => true},
     "rebalance" => {"weight" => [], "auto-weights" => false, "use-empty-masters" => false, "timeout" => true, "simulate" => false, "pipeline" => true, "threshold" => true},
     "fix" => {"timeout" => MigrateDefaultTimeout},
+
     "test" => {"replicas" => true},
+    "migrate" => {"from" => true, "to" => true, "slot" => true, "pipeline" => true},
+    "addnode" => {"masterid" => true},
 }
 
 def show_help

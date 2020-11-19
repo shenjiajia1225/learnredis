@@ -50,6 +50,10 @@
  *    (3)给新的master节点配置一个slave节点
  *        newSlaveNode >> cluster replicate masterID
  * 3. 移除节点
+ *    (1) 节点有负责槽位时，需要先进行槽位迁移
+ *    (2) ./redis-trib.rb del-node 127.0.0.1:6371 delNodeID
+ *        等效于. anyNode    >> cluster forget NodeID
+ *        注意要给集群中的每个节点都要发送forget命令
  * 4. 故障处理
  *
  * ruby create cluster 步骤 (作为client连接到各个node,发送命令进行配置)
@@ -1540,21 +1544,25 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
         return;
     }
 
+    // sender的ping消息中的slot数据，检查每个slot的所属关系
     for (j = 0; j < CLUSTER_SLOTS; j++) {
         if (bitmapTestBit(slots,j)) {
             /* The slot is already bound to the sender of this message. */
+            // 本来就属于sender
             if (server.cluster->slots[j] == sender) continue;
 
             /* The slot is in importing state, it should be modified only
              * manually via redis-trib (example: a resharding is in progress
              * and the migrating side slot was already closed and is advertising
              * a new config. We still want the slot to be closed manually). */
+            // 当前slot还在迁移过程中
             if (server.cluster->importing_slots_from[j]) continue;
 
             /* We rebind the slot to the new node claiming it if:
              * 1) The slot was unassigned or the new node claims it with a
              *    greater configEpoch.
              * 2) We are not currently importing the slot. */
+            // 到这里表示要更新slot信息
             if (server.cluster->slots[j] == NULL ||
                 server.cluster->slots[j]->configEpoch < senderConfigEpoch)
             {
@@ -1564,10 +1572,16 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     countKeysInSlot(j) &&
                     sender != myself)
                 {
+                    // 如果这个slot原来属于自己的话，记录一下数据，接下来要删掉
+                    // 注意上面条件会检查 key 是否存在的。在slot迁移时有copy选项,
+                    // 到这里删除是因为之前使用了copy选项
                     dirty_slots[dirty_slots_count] = j;
                     dirty_slots_count++;
                 }
+                //serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] update slot[%d]=>node[%s][%s:%d]", __FUNCTION__, __LINE__,
+                //    myself->ip, myself->port, j, sender->name, sender->ip, sender->port );
 
+                // 设置新的拥有者
                 if (server.cluster->slots[j] == curmaster)
                     newmaster = sender;
                 clusterDelSlot(j);
@@ -1602,8 +1616,11 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
          *
          * In order to maintain a consistent state between keys and slots
          * we need to remove all the keys from the slots we lost. */
+        // 迁移slot过程中，这里要删除数据, 主要是针对在迁移slot过程中使用了copy选项
         for (j = 0; j < dirty_slots_count; j++)
             delKeysInSlot(dirty_slots[j]);
+        serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] delete keycount[%d]", __FUNCTION__, __LINE__,
+            myself->ip, myself->port, dirty_slots_count );
     }
 }
 
@@ -4150,6 +4167,8 @@ void clusterCommand(client *c) {
             }
             // 记录迁移信息
             server.cluster->migrating_slots_to[slot] = n;
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot migrating slot[%d] to[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+                slot, n->name, n->flags, n->ip, n->port );
         } else if (!strcasecmp(c->argv[3]->ptr,"importing") && c->argc == 5) {
             // 迁移槽的目标节点执行此命令, 即将要从nodeID 迁移槽slot到本地
             // 先检查本地是否有此槽位
@@ -4165,6 +4184,8 @@ void clusterCommand(client *c) {
             }
             // 记录槽位迁移信息
             server.cluster->importing_slots_from[slot] = n;
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot importing slot[%d] from[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+                slot, n->name, n->flags, n->ip, n->port );
         } else if (!strcasecmp(c->argv[3]->ptr,"stable") && c->argc == 4) {
             /* CLUSTER SETSLOT <SLOT> STABLE */
             server.cluster->importing_slots_from[slot] = NULL;
@@ -4222,6 +4243,12 @@ void clusterCommand(client *c) {
             // 重新设置slot的拥有者
             clusterDelSlot(slot);
             clusterAddSlot(n,slot);
+            // 此时新节点(迁入slot的节点 )和迁出slot的节点都有正确的slot拥有者信息了.
+            // 节点发送ping消息时会设置自己负责的slot信息(由此函数 clusterBuildMessageHdr 打包slot数据)
+            // 其他节点收到ping消息后会更新本地的slot数据(由此函数 clusterProcessPacket 处理ping内容)
+            // 最终集群中所有节点的本地维护的slot信息一致
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot slot[%d] node[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+                slot, n->name, n->flags, n->ip, n->port );
         } else {
             addReplyError(c,
                 "Invalid CLUSTER SETSLOT action or number of arguments");
@@ -4347,11 +4374,14 @@ void clusterCommand(client *c) {
             addReplyError(c,"Can't forget my master!");
             return;
         }
+        // 删除节点
         clusterBlacklistAddNode(n);
         clusterDelNode(n);
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|
                              CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
+        serverLog( LL_DEBUG, "[XX][%s][%d] self[%s][%d][%s:%d] forget node[%s][%s:%d]", __FUNCTION__, __LINE__,
+            myself->name, myself->flags, myself->ip, myself->port, n->name, n->ip, n->port );
     } else if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc == 3) {
         /* CLUSTER REPLICATE <NODE ID> */
         // 当前节点时一个slave，设置成slave节点, n 是一个master
@@ -4679,6 +4709,9 @@ void restoreCommand(client *c) {
         return;
     }
 
+    serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] key[%s] replace[%d]", __FUNCTION__, __LINE__,
+        myself->ip, myself->port, (char*)c->argv[1]->ptr, replace );
+
     /* Remove the old key if needed. */
     if (replace) dbDelete(c->db,c->argv[1]);
 
@@ -4901,6 +4934,8 @@ try_again:
         zfree(ov); zfree(kv);
         return; /* error sent to the client by migrateGetSocket() */
     }
+    serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] connect to[%s:%d]", __FUNCTION__, __LINE__,
+        myself->ip, myself->port, (char*)c->argv[1]->ptr, atoi(c->argv[2]->ptr) );
 
     rioInitWithBuffer(&cmd,sdsempty());
 
@@ -4949,6 +4984,9 @@ try_again:
          * as a MIGRATE option. */
         if (replace)
             serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"REPLACE",7));
+
+        serverLog( LL_DEBUG, "[XX][%s][%d] numkey[%d/%d] key[%s] select[%d] copy[%d] replace[%d] clusterenable[%d]", __FUNCTION__, __LINE__,
+            j, num_keys, (char*)kv[j]->ptr, select, copy, replace, server.cluster_enabled );
     }
 
     /* Transfer the query to the other node in 64K chunks. */
@@ -5009,6 +5047,9 @@ try_again:
                 /* Populate the argument vector to replace the old one. */
                 newargv[del_idx++] = kv[j];
                 incrRefCount(kv[j]);
+
+                serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] delete key[%s]", __FUNCTION__, __LINE__,
+                    myself->ip, myself->port, (char*)kv[j]->ptr );
             }
         }
     }
