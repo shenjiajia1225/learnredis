@@ -963,6 +963,7 @@ class RedisTrib
         puts if !o[:quiet]
         # Set the new node as the owner of the slot in all the known nodes.
         if !o[:cold]
+            # 注意这里对每个节点都发送setslot node 命令
             @nodes.each{|n|
                 next if n.has_flag?("slave")
                 n.r.cluster("setslot",slot,"node",target.info[:name])
@@ -1520,6 +1521,44 @@ class RedisTrib
         node.r.shutdown
     end
 
+    def delnode_cluster_cmd_ex(argv,opt)
+        xputs ">>> Delete node from cluster #{argv[0]}"
+
+        # Check the existing cluster
+        load_cluster_info_from_node(argv[0])
+        check_cluster
+        if @errors.length != 0
+            puts "ERROR: Please fix your cluster problems before resharding"
+            exit 1
+        end
+        print "Input nodeid which will be delete? "
+        nodeid = STDIN.gets.chop
+        node = get_node_by_name(nodeid)
+        if !node
+            xputs "[ERR] not find such node!"
+            exit 1
+        end
+        if node.slots.length != 0
+            xputs "[ERR] Node #{node} is not empty! Reshard data away and try again."
+            exit 1
+        end
+        xputs ">>> Sending CLUSTER FORGET messages to the cluster..."
+        @nodes.each{|n|
+            next if n == node
+            if n.info[:replicate] && n.info[:replicate].downcase == nodeid
+                # Reconfigure the slave to replicate with some other node
+                master = get_master_with_least_replicas
+                xputs ">>> #{n} as replica of #{master}"
+                n.r.cluster("replicate",master.info[:name])
+            end
+            n.r.cluster("forget", nodeid)
+        }
+
+        # Finally shutdown the node
+        xputs ">>> SHUTDOWN the node."
+        node.r.shutdown
+    end
+
     def set_timeout_cluster_cmd(argv,opt)
         timeout = argv[1].to_i
         if timeout < 100
@@ -1783,7 +1822,8 @@ COMMANDS={
 
     "test"  => ["test_cluster_cmd", -2, "host1:port1 ... hostN:portN"],
     "migrate"  => ["migrate_cluster_cmd", 2, "host:port"],
-    "addnode" => ["addnode_cluster_cmd_ex", 3, "new_host:new_port existing_host:existing_port"]
+    "addnode" => ["addnode_cluster_cmd_ex", 3, "new_host:new_port existing_host:existing_port"],
+    "delnode" => ["delnode_cluster_cmd_ex", 2, "host:port"]
 }
 
 ALLOWED_OPTIONS={
@@ -1797,6 +1837,7 @@ ALLOWED_OPTIONS={
     "test" => {"replicas" => true},
     "migrate" => {"from" => true, "to" => true, "slot" => true, "pipeline" => true},
     "addnode" => {"masterid" => true},
+    "delnode" => {"nodeid" => true},
 }
 
 def show_help

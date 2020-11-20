@@ -537,7 +537,7 @@ void clusterInit(void) {
     server.cluster->mf_end = 0;
     resetManualFailover();
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] myself name[%s] flag[%d]", __FUNCTION__, __LINE__, myself->name, myself->flags );
+    serverLog( LL_DEBUG, "[XX][%s][%d] myself name[%.40s] flag[%d]", __FUNCTION__, __LINE__, myself->name, myself->flags );
 }
 
 /* Reset a node performing a soft or hard reset:
@@ -742,8 +742,8 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->repl_offset_time = 0;
     node->repl_offset = 0;
     listSetFreeMethod(node->fail_reports,zfree);
-    serverLog( LL_DEBUG, "[XX][%s][%d] nodename[%s] name[%s] flags[%d]", __FUNCTION__, __LINE__,
-        nodename ? nodename : "", node->name, node->flags );
+    serverLog( LL_DEBUG, "[XX][%s][%d] name[%.40s] flags[%d]", __FUNCTION__, __LINE__,
+        node->name, node->flags );
     return node;
 }
 
@@ -1354,7 +1354,7 @@ int clusterStartHandshake(char *ip, int port) {
     memcpy(n->ip,norm_ip,sizeof(n->ip));
     n->port = port;
     clusterAddNode(n);
-    serverLog( LL_DEBUG, "[XX][%s][%d] node name[%s] flag[%d] addr[%s:%d]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] node name[%.40s] flag[%d] addr[%s:%d]", __FUNCTION__, __LINE__,
         n->name, n->flags, n->ip, n->port );
     return 1;
 }
@@ -1368,7 +1368,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
     clusterMsgDataGossip *g = (clusterMsgDataGossip*) hdr->data.ping.gossip;
     clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] hdr port[%d] name[%s] flags[%d] count[%d]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] hdr port[%d] name[%.40s] flags[%d] count[%d]", __FUNCTION__, __LINE__,
         ntohs(hdr->port), hdr->sender, ntohs(hdr->flags), count );
 
     while(count--) {
@@ -1388,7 +1388,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
 
         /* Update our state accordingly to the gossip sections */
         node = clusterLookupNode(g->nodename);
-        serverLog( LL_DEBUG, "[XX][%s][%d] gossip addr[%s:%d] name[%s] flags[%d] count[%d] find[%d]", __FUNCTION__, __LINE__,
+        serverLog( LL_DEBUG, "[XX][%s][%d] gossip addr[%s:%d] name[%.40s] flags[%d] count[%d] find[%d]", __FUNCTION__, __LINE__,
             g->ip, ntohs(g->port), g->nodename, flags, count, node?1:0 );
         if (node) {
             /* We already know this node.
@@ -1578,7 +1578,7 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
                     dirty_slots[dirty_slots_count] = j;
                     dirty_slots_count++;
                 }
-                //serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] update slot[%d]=>node[%s][%s:%d]", __FUNCTION__, __LINE__,
+                //serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] update slot[%d]=>node[%.40s][%s:%d]", __FUNCTION__, __LINE__,
                 //    myself->ip, myself->port, j, sender->name, sender->ip, sender->port );
 
                 // 设置新的拥有者
@@ -1696,7 +1696,7 @@ int clusterProcessPacket(clusterLink *link) {
     /* Check if the sender is a known node. */
     sender = clusterLookupNode(hdr->sender);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] sender name[%s]type[%d] find[%d] fromlink[%p]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] sender name[%.40s]type[%d] find[%d] fromlink[%p]", __FUNCTION__, __LINE__,
         hdr->sender, type, sender?1:0, (void*)link );
 
     if (sender && !nodeInHandshake(sender)) {
@@ -1777,7 +1777,7 @@ int clusterProcessPacket(clusterLink *link) {
             clusterAddNode(node);
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
 
-            serverLog( LL_DEBUG, "[XX][%s][%d] MEET first from node[%s:%d] name[%s] flags[%d]", __FUNCTION__, __LINE__,
+            serverLog( LL_DEBUG, "[XX][%s][%d] MEET first from node[%s:%d] name[%.40s] flags[%d]", __FUNCTION__, __LINE__,
                 node->ip, node->port, node->name, node->flags );
         }
 
@@ -1829,7 +1829,7 @@ int clusterProcessPacket(clusterLink *link) {
                 link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
 
-                serverLog( LL_DEBUG, "[XX][%s][%d] MEET Pong from node[%s:%d] final_name[%s] flags[%d]", __FUNCTION__, __LINE__,
+                serverLog( LL_DEBUG, "[XX][%s][%d] MEET Pong from node[%s:%d] final_name[%.40s] flags[%d]", __FUNCTION__, __LINE__,
                     link->node->ip, link->node->port, link->node->name, link->node->flags );
 
             } else if (memcmp(link->node->name,hdr->sender,
@@ -2350,7 +2350,7 @@ void clusterSendPing(clusterLink *link, int type) {
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] targetnode fd[%d] pingtype[%d] freshnodes[%d] wanted[%d] node[%s:%s:%d]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] targetnode fd[%d] pingtype[%d] freshnodes[%d] wanted[%d] node[%.40s:%s:%d]", __FUNCTION__, __LINE__,
         link->fd, type, freshnodes, wanted,
         link->node?link->node->name:"", link->node?link->node->ip:"", link->node?link->node->port:0 );
 
@@ -2403,7 +2403,7 @@ void clusterSendPing(clusterLink *link, int type) {
         gossip->notused2 = 0;
         gossipcount++;
 
-        serverLog( LL_DEBUG, "[XX][%s][%d] gossip_node name[%s]flag[%d]addr[%s:%d]", __FUNCTION__, __LINE__,
+        serverLog( LL_DEBUG, "[XX][%s][%d] gossip_node name[%.40s]flag[%d]addr[%s:%d]", __FUNCTION__, __LINE__,
             this->name, this->flags, this->ip, this->port );
     }
 
@@ -3804,7 +3804,7 @@ void clusterSetMaster(clusterNode *n) {
     replicationSetMaster(n->ip, n->port);
     resetManualFailover();
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] after myself[%s:%s:%d]flag[%d] master[%s:%s:%d]flag[%d]", __FUNCTION__, __LINE__,
+    serverLog( LL_DEBUG, "[XX][%s][%d] after myself[%.40s:%s:%d]flag[%d] master[%.40s:%s:%d]flag[%d]", __FUNCTION__, __LINE__,
         myself->name, myself->ip, myself->port, myself->flags,
         n->name, n->ip, n->port, n->flags );
 }
@@ -4167,7 +4167,7 @@ void clusterCommand(client *c) {
             }
             // 记录迁移信息
             server.cluster->migrating_slots_to[slot] = n;
-            serverLog( LL_DEBUG, "[XX][%s][%d] setslot migrating slot[%d] to[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot migrating slot[%d] to[%.40s][%d][%s:%d]", __FUNCTION__, __LINE__,
                 slot, n->name, n->flags, n->ip, n->port );
         } else if (!strcasecmp(c->argv[3]->ptr,"importing") && c->argc == 5) {
             // 迁移槽的目标节点执行此命令, 即将要从nodeID 迁移槽slot到本地
@@ -4184,7 +4184,7 @@ void clusterCommand(client *c) {
             }
             // 记录槽位迁移信息
             server.cluster->importing_slots_from[slot] = n;
-            serverLog( LL_DEBUG, "[XX][%s][%d] setslot importing slot[%d] from[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot importing slot[%d] from[%.40s][%d][%s:%d]", __FUNCTION__, __LINE__,
                 slot, n->name, n->flags, n->ip, n->port );
         } else if (!strcasecmp(c->argv[3]->ptr,"stable") && c->argc == 4) {
             /* CLUSTER SETSLOT <SLOT> STABLE */
@@ -4247,7 +4247,7 @@ void clusterCommand(client *c) {
             // 节点发送ping消息时会设置自己负责的slot信息(由此函数 clusterBuildMessageHdr 打包slot数据)
             // 其他节点收到ping消息后会更新本地的slot数据(由此函数 clusterProcessPacket 处理ping内容)
             // 最终集群中所有节点的本地维护的slot信息一致
-            serverLog( LL_DEBUG, "[XX][%s][%d] setslot slot[%d] node[%s][%d][%s:%d]", __FUNCTION__, __LINE__,
+            serverLog( LL_DEBUG, "[XX][%s][%d] setslot slot[%d] node[%.40s][%d][%s:%d]", __FUNCTION__, __LINE__,
                 slot, n->name, n->flags, n->ip, n->port );
         } else {
             addReplyError(c,
@@ -4380,13 +4380,14 @@ void clusterCommand(client *c) {
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|
                              CLUSTER_TODO_SAVE_CONFIG);
         addReply(c,shared.ok);
-        serverLog( LL_DEBUG, "[XX][%s][%d] self[%s][%d][%s:%d] forget node[%s][%s:%d]", __FUNCTION__, __LINE__,
+        serverLog( LL_DEBUG, "[XX][%s][%d] self[%.40s][%d][%s:%d] forget node[%.40s][%s:%d]", __FUNCTION__, __LINE__,
             myself->name, myself->flags, myself->ip, myself->port, n->name, n->ip, n->port );
     } else if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc == 3) {
         /* CLUSTER REPLICATE <NODE ID> */
         // 当前节点时一个slave，设置成slave节点, n 是一个master
         clusterNode *n = clusterLookupNode(c->argv[2]->ptr);
-        serverLog( LL_DEBUG, "[XX][%s][%d] replicate flag[%d] master[%s]find[%d]", __FUNCTION__, __LINE__, myself->flags, (char*)c->argv[2]->ptr, n?1:0 );
+        serverLog( LL_DEBUG, "[XX][%s][%d] replicate flag[%d] master[%s]find[%d]", __FUNCTION__, __LINE__,
+            myself->flags, (char*)c->argv[2]->ptr, n?1:0 );
         /* Lookup the specified node in our table. */
         if (!n) {
             addReplyErrorFormat(c,"Unknown node %s", (char*)c->argv[2]->ptr);
@@ -4709,8 +4710,8 @@ void restoreCommand(client *c) {
         return;
     }
 
-    serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] key[%s] replace[%d]", __FUNCTION__, __LINE__,
-        myself->ip, myself->port, (char*)c->argv[1]->ptr, replace );
+    serverLog( LL_DEBUG, "[XX][%s][%d] self[%s:%d] replace[%d] key[%s]", __FUNCTION__, __LINE__,
+        myself->ip, myself->port, replace, (char*)c->argv[1]->ptr );
 
     /* Remove the old key if needed. */
     if (replace) dbDelete(c->db,c->argv[1]);
