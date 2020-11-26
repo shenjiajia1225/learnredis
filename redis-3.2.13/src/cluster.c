@@ -55,6 +55,8 @@
  *        等效于. anyNode    >> cluster forget NodeID
  *        注意要给集群中的每个节点都要发送forget命令
  * 4. 故障处理
+ *    (1) 故障failover
+ *    (2) 主动failover
  *
  * ruby create cluster 步骤 (作为client连接到各个node,发送命令进行配置)
  * 命令实例：redis-trib.rb create --replicas 1 127.0.0.1:6379 127.0.0.1:6380 127.0.0.1:6381 127.0.0.1:6382 127.0.0.1:6383 127.0.0.1:6384
@@ -758,6 +760,8 @@ clusterNode *createClusterNode(char *nodename, int flags) {
  * failure report from the same sender. 1 is returned if a new failure
  * report is created. */
 int clusterNodeAddFailureReport(clusterNode *failing, clusterNode *sender) {
+    // node->fail_reports 保存了所有报告此node fail的sender节点
+    // 注意这里的sender都是master
     list *l = failing->fail_reports;
     listNode *ln;
     listIter li;
@@ -769,6 +773,8 @@ int clusterNodeAddFailureReport(clusterNode *failing, clusterNode *sender) {
     while ((ln = listNext(&li)) != NULL) {
         fr = ln->value;
         if (fr->node == sender) {
+            serverLog( LL_DEBUG, "[XX][%s][%d] sender[%.40s] aleardy report node[%.40s] PFAIL", __FUNCTION__, __LINE__,
+                sender->name, failing->name );
             fr->time = mstime();
             return 0;
         }
@@ -779,6 +785,8 @@ int clusterNodeAddFailureReport(clusterNode *failing, clusterNode *sender) {
     fr->node = sender;
     fr->time = mstime();
     listAddNodeTail(l,fr);
+    serverLog( LL_DEBUG, "[XX][%s][%d] sender[%.40s] first report node[%.40s] PFAIL", __FUNCTION__, __LINE__,
+        sender->name, failing->name );
     return 1;
 }
 
@@ -796,6 +804,7 @@ void clusterNodeCleanupFailureReports(clusterNode *node) {
                      CLUSTER_FAIL_REPORT_VALIDITY_MULT;
     mstime_t now = mstime();
 
+    // 删除很长时间没有报告过node fail状态的节点
     listRewind(l,&li);
     while ((ln = listNext(&li)) != NULL) {
         fr = ln->value;
@@ -829,8 +838,12 @@ int clusterNodeDelFailureReport(clusterNode *node, clusterNode *sender) {
     if (!ln) return 0; /* No failure report from this sender. */
 
     /* Remove the failure report. */
+    // 删除当前sender报告的fail信息
     listDelNode(l,ln);
+    // 此节点可能已经恢复了，但是其他节点的正常数据还没过来，先尝试删除长时间没有在报告fail的report
     clusterNodeCleanupFailureReports(node);
+    serverLog( LL_DEBUG, "[XX][%s][%d] sender[%.40s] report node[%.40s] BACK del failure", __FUNCTION__, __LINE__,
+        sender->name, node->name );
     return 1;
 }
 
@@ -838,6 +851,7 @@ int clusterNodeDelFailureReport(clusterNode *node, clusterNode *sender) {
  * not including this node, that may have a PFAIL or FAIL state for this
  * node as well. */
 int clusterNodeFailureReportsCount(clusterNode *node) {
+    // 要先清一下过期的fail报告
     clusterNodeCleanupFailureReports(node);
     return listLength(node->fail_reports);
 }
@@ -1220,7 +1234,9 @@ void markNodeAsFailingIfNeeded(clusterNode *node) {
     int failures;
     int needed_quorum = (server.cluster->size / 2) + 1;
 
+    // node没有CLUSTER_NODE_PFAIL状态return
     if (!nodeTimedOut(node)) return; /* We can reach it. */
+    // 已经处于FAIL状态了
     if (nodeFailed(node)) return; /* Already FAILing. */
 
     failures = clusterNodeFailureReportsCount(node);
@@ -1236,8 +1252,11 @@ void markNodeAsFailingIfNeeded(clusterNode *node) {
     node->flags |= CLUSTER_NODE_FAIL;
     node->fail_time = mstime();
 
+    serverLog( LL_DEBUG, "[XX][%s][%d] node[%.40s] flags[%d] FAIL", __FUNCTION__, __LINE__, node->name, node->flags );
+
     /* Broadcast the failing node name to everybody, forcing all the other
      * reachable nodes to flag the node as FAIL. */
+    // 广播节点FAIL
     if (nodeIsMaster(myself)) clusterSendFail(node->name);
     clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE|CLUSTER_TODO_SAVE_CONFIG);
 }
@@ -1393,15 +1412,19 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
         if (node) {
             /* We already know this node.
                Handle failure reports, only when the sender is a master. */
+            // sender报告node的状态给myself
             if (sender && nodeIsMaster(sender) && node != myself) {
                 if (flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) {
+                    // sender报告node fail状态
                     if (clusterNodeAddFailureReport(node,sender)) {
                         serverLog(LL_VERBOSE,
                             "Node %.40s reported node %.40s as not reachable.",
                             sender->name, node->name);
                     }
+                    // 设置完fail报告，要检查是否可以客观下线了
                     markNodeAsFailingIfNeeded(node);
                 } else {
+                    // sender报告node 正常状态
                     if (clusterNodeDelFailureReport(node,sender)) {
                         serverLog(LL_VERBOSE,
                             "Node %.40s reported node %.40s is back online.",
@@ -1420,6 +1443,7 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                 !(flags & (CLUSTER_NODE_FAIL|CLUSTER_NODE_PFAIL)) &&
                 (strcasecmp(node->ip,g->ip) || node->port != ntohs(g->port)))
             {
+                // myself的node信息 和 sender报告的node信息不一致 。断开并更新
                 if (node->link) freeClusterLink(node->link);
                 memcpy(node->ip,g->ip,NET_IP_STR_LEN);
                 node->port = ntohs(g->port);
@@ -1862,7 +1886,8 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* Update our info about the node */
         if (link->node && type == CLUSTERMSG_TYPE_PONG) {
-            // 发送meet后第一此收到pong也会到这里
+            // 发送meet后第一次收到pong也会到这里
+            // 正常收到来自node的pong消息后 清空ping_sent ，使得当前myself可以再次对此node发送ping
             link->node->pong_received = mstime();
             link->node->ping_sent = 0;
 
@@ -2001,6 +2026,7 @@ int clusterProcessPacket(clusterLink *link) {
         // 处理协议内容
         if (sender) clusterProcessGossipSection(hdr,link);
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
+        // 收到来自其他master发送过来的 node FAIL 消息
         clusterNode *failing;
 
         if (sender) {
@@ -2016,6 +2042,8 @@ int clusterProcessPacket(clusterLink *link) {
                 failing->flags &= ~CLUSTER_NODE_PFAIL;
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                      CLUSTER_TODO_UPDATE_STATE);
+                serverLog( LL_DEBUG, "[XX][%s][%d] self[%.40s][%d] node[%.40s][%d] FAIL", __FUNCTION__, __LINE__,
+                    myself->name, myself->flags, failing->name, failing->flags );
             }
         } else {
             serverLog(LL_NOTICE,
@@ -2280,6 +2308,7 @@ void clusterBuildMessageHdr(clusterMsg *hdr, int type) {
     /* Compute the message length for certain messages. For other messages
      * this is up to the caller. */
     if (type == CLUSTERMSG_TYPE_FAIL) {
+        // 打包一个FAIL msg
         totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
         totlen += sizeof(clusterMsgDataFail);
     } else if (type == CLUSTERMSG_TYPE_UPDATE) {
@@ -2346,6 +2375,8 @@ void clusterSendPing(clusterLink *link, int type) {
     hdr = (clusterMsg*) buf;
 
     /* Populate the header. */
+    // 如果要发送一个ping消息，记录一下发送时间，保证对一个node的ping不会多次发送
+    // 在收到对端的node回复pong 后会清空这个值，表示一个ping/pong完成，可以下一次ping
     if (link->node && type == CLUSTERMSG_TYPE_PING)
         link->node->ping_sent = mstime();
     clusterBuildMessageHdr(hdr,type);
@@ -2367,6 +2398,7 @@ void clusterSendPing(clusterLink *link, int type) {
         if (this == myself) continue;
 
         /* Give a bias to FAIL/PFAIL nodes. */
+        // 当迭代次数达到一定值时，会优先选取 FAIL 的node信息 发送出去
         if (maxiterations > wanted*2 &&
             !(this->flags & (CLUSTER_NODE_PFAIL|CLUSTER_NODE_FAIL)))
             continue;
@@ -2398,7 +2430,7 @@ void clusterSendPing(clusterLink *link, int type) {
         gossip->pong_received = htonl(this->pong_received);
         memcpy(gossip->ip,this->ip,sizeof(this->ip));
         gossip->port = htons(this->port);
-        gossip->flags = htons(this->flags);
+        gossip->flags = htons(this->flags); // 如果node FAIL了此状态一起打包后发给其他节点
         gossip->notused1 = 0;
         gossip->notused2 = 0;
         gossipcount++;
@@ -2509,6 +2541,7 @@ void clusterSendFail(char *nodename) {
 
     clusterBuildMessageHdr(hdr,CLUSTERMSG_TYPE_FAIL);
     memcpy(hdr->data.fail.about.nodename,nodename,CLUSTER_NAMELEN);
+    serverLog( LL_DEBUG, "[XX][%s][%d] broadcast node[%.40s] FAIL", __FUNCTION__, __LINE__, nodename );
     clusterBroadcastMessage(buf,ntohl(hdr->totlen));
 }
 
@@ -3213,6 +3246,7 @@ void clusterCron(void) {
     // meet命令可以给redis节点添加 nodes
 
     /* Check if we have disconnected nodes and re-establish the connection. */
+    /// [建立连接或重连]
     di = dictGetSafeIterator(server.cluster->nodes);
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
@@ -3290,6 +3324,7 @@ void clusterCron(void) {
 
     /* Ping some random node 1 time every 10 iterations, so that we usually ping
      * one random node every second. */
+    /// [定时发送ping]
     // 每10次迭代 会选1个节点ping
     if (!(iteration % 10)) {
         int j;
@@ -3301,9 +3336,13 @@ void clusterCron(void) {
             clusterNode *this = dictGetVal(de);
 
             /* Don't ping nodes disconnected or with a ping currently active. */
+            // clusterSendPing函数会设置节点发送ping_sent为当前发送时间, 如果当前准备要发送的node还有ping的回复pong没有收到
+            // 则不在对此node发送ping. 当前节点myself会等待此节点的pong消息，或是进行故障处理
             if (this->link == NULL || this->ping_sent != 0) continue;
+            // 对自己或是正在握手的节点也不发送ping
             if (this->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_HANDSHAKE))
                 continue;
+            // 找最旧一个收到pong消息的node，准备给此node发送ping
             if (min_pong_node == NULL || min_pong > this->pong_received) {
                 min_pong_node = this;
                 min_pong = this->pong_received;
@@ -3321,6 +3360,7 @@ void clusterCron(void) {
      *    slaves).
      * 2) Count the max number of non failing slaves for a single master.
      * 3) Count the number of slaves for our master, if we are a slave. */
+    /// [node故障检查] 对每个node检查
     orphaned_masters = 0;
     max_slaves = 0;
     this_slaves = 0;
@@ -3355,6 +3395,7 @@ void clusterCron(void) {
         /* If we are waiting for the PONG more than half the cluster
          * timeout, reconnect the link: maybe there is a connection
          * issue even if the node is alive. */
+        // 超过预设的时间还没收到pong消息，则断开连接
         if (node->link && /* is connected */
             now - node->link->ctime >
             server.cluster_node_timeout && /* was not already reconnected */
@@ -3371,6 +3412,8 @@ void clusterCron(void) {
          * received PONG is older than half the cluster timeout, send
          * a new ping now, to ensure all the nodes are pinged without
          * a too big delay. */
+        // 上面ping是随机选择的，可能会有节点一直没被随机到
+        // 这里检查太长时间没有ping的node，直接发送一个ping
         if (node->link &&
             node->ping_sent == 0 &&
             (now - node->pong_received) > server.cluster_node_timeout/2)
@@ -3381,6 +3424,7 @@ void clusterCron(void) {
 
         /* If we are a master and one of the slaves requested a manual
          * failover, ping it continuously. */
+        // 主动故障处理 TODO
         if (server.cluster->mf_end &&
             nodeIsMaster(myself) &&
             server.cluster->mf_slave == node &&
@@ -3397,15 +3441,18 @@ void clusterCron(void) {
          * the PONG, then node->ping_sent is zero, so can't reach this
          * code at all. */
         delay = now - node->ping_sent;
-
+        // ping超时了 设置node主观下线
         if (delay > server.cluster_node_timeout) {
             /* Timeout reached. Set the node as possibly failing if it is
              * not already in this state. */
             if (!(node->flags & (CLUSTER_NODE_PFAIL|CLUSTER_NODE_FAIL))) {
                 serverLog(LL_DEBUG,"*** NODE %.40s possibly failing",
                     node->name);
+                // 设置下线, 标记, 此节点被标记PFAIL后在定时ping中会通过gossip发送给其他节点
                 node->flags |= CLUSTER_NODE_PFAIL;
                 update_state = 1;
+                serverLog( LL_DEBUG, "[XX][%s][%d] node name[%.40s] flags[%d] PFAIL", __FUNCTION__, __LINE__,
+                    node->name, node->flags );
             }
         }
     }
@@ -3437,6 +3484,7 @@ void clusterCron(void) {
             clusterHandleSlaveMigration(max_slaves);
     }
 
+    // 故障转移, 有节点被标记为主观下线或是当前集群已处于fail状态
     if (update_state || server.cluster->state == CLUSTER_FAIL)
         clusterUpdateState();
 }
@@ -3675,12 +3723,19 @@ void clusterUpdateState(void) {
      * to FAIL. */
     {
         int needed_quorum = (server.cluster->size / 2) + 1;
+        serverLog( LL_DEBUG, "[XX][%s][%d] cluster_require_full_coverage[%d] curstate[%d] newstate[%d] cluster.size[%d] reachablemaster[%d] needquorum[%d]",
+            __FUNCTION__, __LINE__, server.cluster_require_full_coverage, server.cluster->state, new_state,
+            server.cluster->size, reachable_masters, needed_quorum );
 
         if (reachable_masters < needed_quorum) {
             new_state = CLUSTER_FAIL;
             among_minority_time = mstime();
         }
     }
+
+    // 有节点FAIL时，会标记整个cluster FAIL状态
+    // 此时会对client的命令特殊处理
+    // 真正的故障处理在 clusterHandleSlaveFailover
 
     /* Log a state change */
     if (new_state != server.cluster->state) {
